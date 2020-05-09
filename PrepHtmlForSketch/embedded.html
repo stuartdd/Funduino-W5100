@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=2" />
+        <style type="text/css">
+            button {
+                background-color:greenyellow;
+                width: 60px;
+            }    
+        </style>
+        <script>
+            function refresh() {
+                loadXMLDoc("relay");
+                setTimeout(function () {
+                    refresh();
+                }, 5000);
+            }
+            function loadXMLDoc(query) {
+                var xhttp = new XMLHttpRequest();
+                xhttp.onreadystatechange = function () {
+                    if (this.readyState === 4 && this.status === 200) {
+                        var obj = JSON.parse(this.responseText);
+                        if (obj.on === undefined) {
+                            if (obj.err === undefined) {
+                                console.error("ERROR:Response not identified:[" + this.responseText + "]");
+                            } else {
+                                console.error("ERROR:[" + this.responseText + "]");
+                                document.getElementById("errorMessage").innerHTML = obj.msg;
+                            }
+                        } else {
+                            document.getElementById("errorMessage").innerHTML = "";
+                            document.getElementById("tabR1").innerHTML = obj.on.r1;
+                            document.getElementById("tabR2").innerHTML = obj.on.r2;
+                            document.getElementById("tabR3").innerHTML = obj.on.r3;
+                            document.getElementById("tabR4").innerHTML = obj.on.r4;
+                        }
+                    }
+                };
+                console.log("Query[" + query + ']');
+                xhttp.open("GET", query, true);
+                xhttp.send();
+            }
+        </script>
+        <title>Device-001</title>
+    </head>
+    <body onload="refresh()">
+        <h2>Device-001</h2>
+        <span id="errorMessage"></span>
+        <table>
+            <tr>
+                <td>Relay 1</td>
+                <td id="tabR1">?</td>
+                <td><button type="button" onclick="loadXMLDoc('relay/r1=inv')">Switch</button></td>
+            </tr>
+            <tr>
+                <td>Relay 2</td>
+                <td id="tabR2">?</td>
+                <td><button type="button" onclick="loadXMLDoc('relay/r2=inv')">Switch</button></td>
+            </tr>
+            <tr>
+                <td>Relay 3</td>
+                <td id="tabR3">?</td>
+                <td><button type="button" onclick="loadXMLDoc('relay/r3=inv')">Switch</button></td>
+            </tr>
+            <tr>
+                <td>Relay 4</td>
+                <td id="tabR4">?</td>
+                <td><button type="button" onclick="loadXMLDoc('relay/r4=inv')">Switch</button></td>
+            </tr>
+            <tr>
+                <td>ALL</td>
+                <td></td>
+                <td><button type="button" onclick="loadXMLDoc('relay/all=on')">ON</button></td>
+            </tr>
+            <tr>
+                <td>ALL</td>
+                <td></td>
+                <td><button type="button" onclick="loadXMLDoc('relay/all=off')">OFF</button></td>
+            </tr>
+            <tr>
+                <td colspan="2">Reload State</td>
+                <td><button type="button" onclick="loadXMLDoc('relay')">Refresh</button></td>
+            </tr>
+        </table>
+    </body>
+
+</html>
