@@ -3,11 +3,14 @@
 #include <Ethernet.h>
 #include <avr/pgmspace.h>
 #include <EEPROM.h>
+#include <avr/wdt.h>
 
 #define MAC 0x34, 0xA9, 0x5D, 0x09, 0xCF, 0xED
 #define IP 192, 168, 1, 177
 #define PORT 80
 #define BAUD 115200
+#define PULSE_ON 950
+#define PULSE_OFF 50
 /*
    Define a physical pin for each relay.
 */
@@ -15,7 +18,21 @@
 #define RELAY2PIN 3
 #define RELAY3PIN 4
 #define RELAY4PIN 5
+#define SENSE0PIN 8
+#define SENSE1PIN 9
+/*
+   define Active (LED) pin
+   and Pulse (LED) pin
+*/
 #define LEDACTPIN 6
+#define PULSE_PIN 7
+/*
+   Define a physical pin for each analog value.
+*/
+#define A0_PIN 0
+#define A1_PIN 1
+#define A2_PIN 2
+#define A3_PIN 3
 /*
    Define a number for each relay
    These are used as indexes in the the bits[] and pins[] arrays.
@@ -75,6 +92,7 @@ IPAddress ip(IP);
 // (port 80 is default for HTTP):
 EthernetServer server(PORT);
 
+
 /*
    The state of each relay is held in the bits of this byte.
    See RELAY1BIT to RELAY4BIT above to find the bits.
@@ -90,6 +108,26 @@ byte sysData = false;
 byte sysDataEEPROM = false;
 bool debug = false;
 
+unsigned long nextPulseFlip = 0;
+boolean pulseOn = true;
+boolean inProgress = false;
+
+float voltage0 = 0;
+float voltage1 = 0;
+float voltage2 = 0;
+float voltage3 = 0;
+
+/*
+   Analog constants
+*/
+const float inToVolts = 4.814;  // (Vref  / 1024) * 1000
+/*
+   Constants for Temppreture chip MCP9701
+*/
+const float vout0 = 400;        //  sensor output voltage in mV at 0°C (400 * 1000)
+const float tc = 19.53;         // mV for °C temperature constant for the  MCP9701/A
+
+
 typedef enum READING {
   Heading,
   ContentLen,
@@ -101,26 +139,24 @@ typedef enum READING {
 
 
 void setup() {
+  wdt_enable(WDTO_8S);
   /*
     Define all the pins
   */
   pinMode(LEDACTPIN, OUTPUT);
   digitalWrite(LEDACTPIN, HIGH);
+  pinMode(PULSE_PIN, OUTPUT);
+  digitalWrite(PULSE_PIN, HIGH);
   pinMode(RELAY1PIN, OUTPUT);
   pinMode(RELAY2PIN, OUTPUT);
   pinMode(RELAY3PIN, OUTPUT);
   pinMode(RELAY4PIN, OUTPUT);
+  pinMode(SENSE0PIN, INPUT_PULLUP);
+  pinMode(SENSE1PIN, INPUT_PULLUP);
   /*
     Read the relay state from the EPROM
   */
   loadEEPROM();
-  /*
-     Set the relays to match the loaded state.
-  */
-  digitalWrite(RELAY1PIN, getRelayPinState(RELAY1));
-  digitalWrite(RELAY2PIN, getRelayPinState(RELAY2));
-  digitalWrite(RELAY3PIN, getRelayPinState(RELAY3));
-  digitalWrite(RELAY4PIN, getRelayPinState(RELAY4));
 
   // Open serial communications and wait for port to open:
   Serial.begin(BAUD);
@@ -137,10 +173,38 @@ void setup() {
     Serial.println(Ethernet.localIP());
   }
   digitalWrite(LEDACTPIN, LOW);
+  digitalWrite(PULSE_PIN, LOW);
+  nextPulseFlip = millis() + PULSE_OFF;
+  pulseOn = false;
 }
 
 
 void loop() {
+  if (millis() > nextPulseFlip) {
+    if (pulseOn) {
+      nextPulseFlip = millis() + PULSE_ON;
+      pulseOn = false;
+      digitalWrite(PULSE_PIN, LOW);
+    } else {
+      nextPulseFlip = millis() + PULSE_OFF;
+      pulseOn = true;
+      digitalWrite(PULSE_PIN, HIGH);
+      if (!inProgress) {
+        wdt_reset();
+        if (debug) {
+          Serial.print("WDT Reset:");
+          Serial.println(millis());
+        }
+      } else {
+        if (debug) {
+          Serial.print("InProgress:");
+          Serial.println(millis());
+        }
+      }
+    }
+  }
+
+
   // listen for incoming clients
   EthernetClient client = server.available();
   if (client) {
@@ -159,6 +223,7 @@ void loop() {
 
     while (client.connected() && notFinished) {
       digitalWrite(LEDACTPIN, HIGH);
+      inProgress = true;
 
       if (client.available()) {
         c = client.read();
@@ -250,9 +315,10 @@ void loop() {
     delay(1);
     // close the connection:
     client.stop();
+    inProgress = false;
     digitalWrite(LEDACTPIN, LOW);
     if (debug) {
-      Serial.println();
+      Serial.println("Done");
     }
   }
 }
@@ -407,6 +473,13 @@ void loadEEPROM() {
     relayBits = value;
   }
   relayBitsEEPROM = relayBits;
+  /*
+     Set the relays to match the loaded state.
+  */
+  digitalWrite(RELAY1PIN, getRelayPinState(RELAY1));
+  digitalWrite(RELAY2PIN, getRelayPinState(RELAY2));
+  digitalWrite(RELAY3PIN, getRelayPinState(RELAY3));
+  digitalWrite(RELAY4PIN, getRelayPinState(RELAY4));
 
   sysData = EEPROM.read(EEPROM_BASE + 1);
   sysDataEEPROM = sysData;
@@ -428,12 +501,22 @@ void updateEPROM() {
 
 void sendRelayStatus(EthernetClient client) {
   sendHeader(client, "200 OK");
+  voltage0  = analogRead(A0_PIN) * inToVolts;
+  voltage1  = analogRead(A1_PIN) * inToVolts;
+  voltage2  = analogRead(A2_PIN) * inToVolts;
+  voltage3  = analogRead(A3_PIN) * inToVolts;
   String content = "{\"id\":\"001\",\"up\":\"" + String(millis()) + "\",\"debug\":" + (debug ? "true" : "false") + ","
                    "\"on\":{"
                    "\"r1\":\"" + getRelayTextState(RELAY1) + "\","
                    "\"r2\":\"" + getRelayTextState(RELAY2) + "\","
                    "\"r3\":\"" + getRelayTextState(RELAY3) + "\","
-                   "\"r4\":\"" + getRelayTextState(RELAY4) + "\"}"
+                   "\"r4\":\"" + getRelayTextState(RELAY4) + "\","
+                   "\"d0\":" + digitalRead(SENSE0PIN) + ","
+                   "\"d1\":" + digitalRead(SENSE1PIN) + ","
+                   "\"a0\":" + vinToCelcius(voltage0) + ","
+                   "\"a1\":" + vinToCelcius(voltage1) + ","
+                   "\"a2\":" + vinToVolts(voltage2) + ","
+                   "\"a3\":" + vinToVolts(voltage3) + "}"
                    "}";
   client.print("Content-Length: ");
   client.println(content.length());
@@ -453,10 +536,11 @@ void sendHtmlPage(EthernetClient client) {
   client.println(len);
   client.println("Content-Type: text/html");
   client.println("");
-  char myChar;
+  char c1;
+  char c2;
   for (int k = 0; k < len; k++) {
-    myChar = pgm_read_byte_near(htmlPage + k);
-    client.write(myChar);
+    c1 = pgm_read_byte_near(htmlPage + k);
+    client.write(c1);
   }
   if (debug) {
     Serial.println("HTML index.htm. Sent");
@@ -464,7 +548,7 @@ void sendHtmlPage(EthernetClient client) {
 }
 
 void sendError(EthernetClient client, String msg, String rc) {
-  sendHeader(client, rc);
+  sendHeader(client, "200 OK");
   String cont = "{\"id\":\"001\",\"err\":\"" + rc + "\",\"msg\":\"" + msg + "\"}";
   client.print("Content-Length: ");
   client.println(cont.length());
@@ -500,4 +584,19 @@ byte setBit(byte byteIn, bool on, byte byteBit) {
 
 bool getBit(byte byteIn, byte byteBit) {
   return ((byteIn & byteBit) != 0);
+}
+
+float vinToCelcius(float vIn) {
+  float celc = (vIn - vout0) / tc ;
+  if (debug) {
+    Serial.print("Temp: vIn: ");
+    Serial.print(vIn);
+    Serial.print(" celc: ");
+    Serial.println(celc);
+  }
+  return celc;
+}
+
+float vinToVolts(float vIn) {
+  return vIn / 1000;
 }

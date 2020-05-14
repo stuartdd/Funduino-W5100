@@ -18,11 +18,13 @@
 package prephtmlforsketch;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.file.Files;
-import java.nio.file.OpenOption;
 import java.nio.file.StandardOpenOption;
 import java.util.List;
+import java.util.Map;
+import java.util.Properties;
 
 /**
  *
@@ -30,47 +32,83 @@ import java.util.List;
  */
 public class PrepHtmlForSketch {
 
-    private static StringBuilder sb = new StringBuilder();
-    private static boolean appendNL = false;
+    private static Properties prop;
+
+    private static int filesCount = 0;
 
     /**
      * @param args the command line arguments
      */
     public static void main(String[] args) throws IOException {
-        if (args.length == 0) {
-            System.out.println("File Name required");
+        if (args.length == 1) {
+            File f = new File(args[0]);
+            if (f.exists()) {
+                prop = new Properties();
+                prop.load(new FileInputStream(f));
+            } else {
+                System.out.println("Properties file " + args[0] + " not found");
+                System.exit(1);
+            }
+        } else {
+            System.out.println("Properties file name is required");
             System.exit(1);
         }
-        if (args.length > 1) {
-            appendNL = args[1].equalsIgnoreCase("nl");
-        } else {
-            appendNL = false;
+
+        for (Map.Entry<Object, Object> nvp : prop.entrySet()) {
+            String key = nvp.getKey().toString();
+            if (nvp.getKey().toString().startsWith("name.")) {
+                String name = nvp.getValue().toString();
+                String fileName = prop.getProperty(name + ".filename", null);
+                if (fileName == null) {
+                    System.out.println("property " + name + ".filename not defined in file " + args[0]);
+                    System.exit(1);
+                }
+                File f = new File(fileName);
+                if (f.exists()) {
+                    processFile(f, name);
+                } else {
+                    System.out.println("HTML file " + fileName + " not found");
+                    System.exit(1);
+                }
+            }
         }
+
         File f = new File(args[0]);
+        if (filesCount == 0) {
+            System.out.println("No files were processed.");
+            System.exit(1);
+
+        }
+    }
+
+    private static void processFile(File f, String name) throws IOException {
         if (f.exists()) {
+            StringBuilder sb = new StringBuilder();
             List<String> lines = Files.readAllLines(f.toPath());
-            processLines(lines, sb);
-//            sb.setLength(sb.length()-2);
-            String out = "const char htmlPage[] PROGMEM = " + sb.toString().trim() + ";";
+            processLines(lines, sb, getBoolean(name+".nl", false));
+            String wrap = prop.getProperty(name+".wrap", "%%");
+            String out = wrap.replace("%%", sb.toString().trim());
             System.out.println(out);
-            File outFile = new File(args[0] + ".cpp");
+            File outFile = new File(f.getAbsolutePath() + ".cpp");
             if (outFile.exists()) {
                 outFile.delete();
             }
             Files.write(outFile.toPath(), out.getBytes(), StandardOpenOption.CREATE);
+            filesCount++;
         } else {
             System.out.println("File does not exist.");
             System.exit(1);
         }
+
     }
 
-    private static void processLines(List<String> lines, StringBuilder sb) {
+    private static void processLines(List<String> lines, StringBuilder sb, boolean appendNL) {
         for (String l : lines) {
-            processLine(l, sb);
+            processLine(l, sb, appendNL);
         }
     }
 
-    private static void processLine(String l, StringBuilder sb) {
+    private static void processLine(String l, StringBuilder sb, boolean appendNL) {
         StringBuilder lin1 = new StringBuilder();
         for (char c : l.toCharArray()) {
             if (c == '"') {
@@ -99,5 +137,10 @@ public class PrepHtmlForSketch {
         if (lin2.length() > 2) {
             sb.append(lin2).append('\n');
         }
+    }
+
+    private static boolean getBoolean(String key, boolean defaultValue) {
+        String v = prop.getProperty(key, Boolean.toString(defaultValue));
+        return v.equalsIgnoreCase("true");
     }
 }
