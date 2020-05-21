@@ -4,17 +4,6 @@
 #include <avr/pgmspace.h>
 #include <EEPROM.h>
 #include <avr/wdt.h>
-#include <Servo.h>
-
-/*
-   Define servo positions for microswitch positions
-*/
-#define BON_AOFF 125 // B ON A OFF
-#define BON_AON 80 // BOTH ON
-#define BOFF_AON 50 // A ON B OFF
-#define BOFF_AOFF 10 // ALL OFF
-#define PAUSE 10
-#define SERVO1PIN 2
 
 #define MAC 0x34, 0xA9, 0x5D, 0x09, 0xCF, 0xED
 #define IP 192, 168, 1, 177
@@ -23,51 +12,56 @@
 #define PULSE_ON 950
 #define PULSE_OFF 50
 /*
-   Define a physical pin for each function.
+   Define a physical pin for each relay.
 */
-#define LEDACTPIN 3
-#define LED_A_PIN 4
-#define LED_B_PIN 5
-#define BTN_A_PIN 6
-#define BTN_B_PIN 7
-#define EN_SV_PIN 8
+#define RELAY1PIN 2
+#define RELAY2PIN 3
+#define RELAY3PIN 4
+#define RELAY4PIN 5
+#define SENSE0PIN 8
+#define SENSE1PIN 9
 /*
-   Define a physical pin for each analog value and digital sensors
+   define Active (LED) pin
+   and Pulse (LED) pin
 */
-#define VOLTAGE_0_PIN A0
-#define VOLTAGE_1_PIN A1
-#define VOLTAGE_2_PIN A2
-#define VOLTAGE_3_PIN A3
+#define LEDACTPIN 6
+#define PULSE_PIN 7
 /*
-   Define a physical pin for each digital sensors
+   Define a physical pin for each analog value.
 */
-#define D4_PIN A4
-#define D5_PIN A5
-#define D6_PIN A6
-#define D7_PIN A6
+#define A0_PIN 0
+#define A1_PIN 1
+#define A2_PIN 2
+#define A3_PIN 3
 /*
-   Define a number for each switch
-   These are used as indexes in the the bits[]
+   Define a number for each relay
+   These are used as indexes in the the bits[] and pins[] arrays.
    They must start at 0 and end one less that the array size.
 */
-#define SWITCH_A 0
-#define SWITCH_B 1
+#define RELAY1 0
+#define RELAY2 1
+#define RELAY3 2
+#define RELAY4 3
 /*
-   Define which bit represents a switch in the switchBits value below.
+   Define which bit represents a relay in the relayBits value below.
 */
-#define SWITCH_A_BIT B00000001
-#define SWITCH_B_BIT B00000010
+#define RELAY1BIT B00000001
+#define RELAY2BIT B00000010
+#define RELAY3BIT B00000100
+#define RELAY4BIT B00001000
 #define DEBUG1BIT B00000001
-
 /*
-   The address in EEP|ROM to store switchBits
-   and remember the state of each switch even after a power off.
+   As the voltage out for each relay is 5v (HIGH) for OFF and 0v (LOW)
+   for ON we define these values for readability only. If your relays
+   are 5v (HIGH) for ON and 0v (LOW) for OFF swap these values.
+*/
+#define RL_OFF HIGH
+#define RL_ON LOW
+/*
+   The address in EEP|ROM to store relayBits
+   and remember the state of each relay even after a power off.
 */
 #define EEPROM_BASE 0
-
-#define WDT_DELAY 4000
-#define BTN_TIMER_DELAY 50
-#define SERVO_PWR_DELAY 1000
 /**
    Read the HTML/JavaScript String value.
    It is stored in FLASH memory along with the code.
@@ -78,13 +72,18 @@
 */
 #include "PrepHtmlForSketch/embedded.html.cpp"
 /*
-   Bits defines the bit positions for each switch using an index.
+   Bits defines the bit positions for each relay using an index.
 */
-byte bits[] = {SWITCH_A_BIT, SWITCH_B_BIT};
+byte bits[] = {RELAY1BIT, RELAY2BIT, RELAY3BIT, RELAY4BIT};
+/*
+   Bits defines the pins for each relay using an index.
+*/
+byte pins[] = {RELAY1PIN, RELAY2PIN, RELAY3PIN, RELAY4PIN};
+
 
 // Enter a MAC address and IP address for your controller below.
 // The IP address will be dependent on your local network:
-byte mac[] = {MAC};
+byte mac[] = {MAC };
 
 IPAddress ip(IP);
 
@@ -93,19 +92,17 @@ IPAddress ip(IP);
 // (port 80 is default for HTTP):
 EthernetServer server(PORT);
 
-Servo servoMotor;
-int servoPosition;
 
 /*
-   The state of each switch is held in the bits of this byte.
-   See SWITCH_A_BIT to SWITCH_B_BIT above to find the bits.
+   The state of each relay is held in the bits of this byte.
+   See RELAY1BIT to RELAY4BIT above to find the bits.
 
-   The switchBitsEEPROM is used to mirror what is is in EEPROM
+   The relayBitsEEPROM is used to mirror what is is in EEPROM
    If these are different then updateEPROM will store the value
-   of switchBits and update the value of switchBitsEEPROM.
+   of relayBits and update the value of relayBitsEEPROM.
 */
-byte switchBits = 0;
-byte switchBitsEEPROM = 0;
+byte relayBits = 0;
+byte relayBitsEEPROM = 0;
 
 byte sysData = false;
 byte sysDataEEPROM = false;
@@ -139,92 +136,27 @@ typedef enum READING {
   Skip
 };
 
-long loop_time = 0;
-long timer_wdt = 0;
-long button_timer = 0;
-long servo_pwr_timer = 0;
 
-bool servo_pwr_on = false;
-bool button_a_pressed = false;
-bool button_b_pressed = false;
-
-
-void digitalPins() {
-  pinMode(LEDACTPIN, OUTPUT);
-  digitalWrite(LEDACTPIN, LOW);
-  pinMode(LED_A_PIN, OUTPUT);
-  digitalWrite(LEDACTPIN, LOW);
-  pinMode(LED_B_PIN, OUTPUT);
-  digitalWrite(LED_B_PIN, LOW);
-  pinMode(BTN_A_PIN, INPUT_PULLUP);
-  pinMode(BTN_B_PIN, INPUT_PULLUP);
-  // Init analog pins for sensor input
-  pinMode(D4_PIN, INPUT_PULLUP);
-  pinMode(D5_PIN, INPUT_PULLUP);
-  pinMode(D6_PIN, INPUT_PULLUP);
-  pinMode(D7_PIN, INPUT_PULLUP);
-}
-
-void servoInit() {
-  servoMotor.attach(SERVO1PIN);
-  setSwitchState();
-  pinMode(EN_SV_PIN, OUTPUT);
-  digitalWrite(EN_SV_PIN, HIGH);
-}
-
-void servoPos(int pos) {
-  if (servoPosition != pos) {
-    /*
-       Power up the servo.
-       Flag it as ON
-       Set a timer to turn it off
-    */
-    digitalWrite(EN_SV_PIN, HIGH);
-    servo_pwr_on = true;
-    servo_pwr_timer = millis() + SERVO_PWR_DELAY;
-    if (debug) {
-      Serial.print(millis());
-      Serial.print(": Servo PWR ON :");
-      Serial.println(servo_pwr_timer);
-    }
-    /*
-       Set the position of the servo
-    */
-    servoPosition = pos;
-    delay(1);
-    servoMotor.write(pos);
-  }
-}
-/*
-   Read the switch state from the EPROM when we start.
-
-   Note Un-Set EPROM locations retirn 255.
-*/
-void loadEEPROM() {
-  byte value = EEPROM.read(EEPROM_BASE);
-  if (value > 32) {
-    switchBits = 0;
-  } else {
-    switchBits = value;
-  }
-  switchBitsEEPROM = switchBits;
-  /*
-     Set the switches to match the loaded state.
-  */
-
-  sysData = EEPROM.read(EEPROM_BASE + 1);
-  sysDataEEPROM = sysData;
-  debug = getBit(sysData, DEBUG1BIT);
-}
 
 void setup() {
   wdt_enable(WDTO_8S);
-  loadEEPROM();
   /*
-    Read the switch state from the EPROM
+    Define all the pins
   */
-  digitalPins();
-  servoInit();
+  pinMode(LEDACTPIN, OUTPUT);
+  digitalWrite(LEDACTPIN, HIGH);
+  pinMode(PULSE_PIN, OUTPUT);
+  digitalWrite(PULSE_PIN, HIGH);
+  pinMode(RELAY1PIN, OUTPUT);
+  pinMode(RELAY2PIN, OUTPUT);
+  pinMode(RELAY3PIN, OUTPUT);
+  pinMode(RELAY4PIN, OUTPUT);
+  pinMode(SENSE0PIN, INPUT_PULLUP);
+  pinMode(SENSE1PIN, INPUT_PULLUP);
+  /*
+    Read the relay state from the EPROM
+  */
+  loadEEPROM();
 
   // Open serial communications and wait for port to open:
   Serial.begin(BAUD);
@@ -241,67 +173,37 @@ void setup() {
     Serial.println(Ethernet.localIP());
   }
   digitalWrite(LEDACTPIN, LOW);
+  digitalWrite(PULSE_PIN, LOW);
   nextPulseFlip = millis() + PULSE_OFF;
   pulseOn = false;
 }
 
 
 void loop() {
-  loop_time = millis();
-  if (loop_time > timer_wdt) {
-    timer_wdt = loop_time + WDT_DELAY;
-    if (!inProgress) {
-      wdt_reset();
-      if (debug) {
-        Serial.print(millis());
-        Serial.println(": WDT Reset:");
-      }
+  if (millis() > nextPulseFlip) {
+    if (pulseOn) {
+      nextPulseFlip = millis() + PULSE_ON;
+      pulseOn = false;
+      digitalWrite(PULSE_PIN, LOW);
     } else {
-      if (debug) {
-        Serial.print(millis());
-        Serial.println(": InProgress:");
-
-      }
-    }
-  }
-
-
-  if (loop_time > button_timer) {
-    button_timer = loop_time + BTN_TIMER_DELAY;
-    if (!digitalRead(BTN_A_PIN)) {
-      if (!button_a_pressed) {
-        button_a_pressed = true;
+      nextPulseFlip = millis() + PULSE_OFF;
+      pulseOn = true;
+      digitalWrite(PULSE_PIN, HIGH);
+      if (!inProgress) {
+        wdt_reset();
         if (debug) {
-          Serial.println("BUTTON A");
+          Serial.print("WDT Reset:");
+          Serial.println(millis());
         }
-        setSwitch(SWITCH_A, !isSwitchOn(SWITCH_A));
-      }
-    } else {
-      button_a_pressed = false;
-    }
-    if (!digitalRead(BTN_B_PIN)) {
-      if (!button_b_pressed) {
-        button_b_pressed = true;
+      } else {
         if (debug) {
-          Serial.println("BUTTON B");
+          Serial.print("InProgress:");
+          Serial.println(millis());
         }
-        setSwitch(SWITCH_B, !isSwitchOn(SWITCH_B));
       }
-    } else {
-      button_b_pressed = false;
     }
   }
 
-  /*
-     If servo power is ON and it is time to turn it OFF
-  */
-  if ((servo_pwr_on) && (loop_time > servo_pwr_timer)) {
-    servo_pwr_on = false;
-    digitalWrite(EN_SV_PIN, LOW);
-    if (debug) {
-      Serial.println(": Servo PWR OFF :");
-    }
-  }
 
   // listen for incoming clients
   EthernetClient client = server.available();
@@ -416,7 +318,7 @@ void loop() {
     inProgress = false;
     digitalWrite(LEDACTPIN, LOW);
     if (debug) {
-      Serial.println("Connection Closed");
+      Serial.println("Done");
     }
   }
 }
@@ -425,9 +327,9 @@ void loop() {
 void sendResponse(EthernetClient client, String method, String path, String body) {
   if (method == "GET") {
     path.toLowerCase();
-    if (path.indexOf("/switch") >= 0) {
-      handleSwitch(path);
-      sendSwitchStatus(client);
+    if (path.indexOf("/relay") >= 0) {
+      switchRelays(path);
+      sendRelayStatus(client);
     } else {
       if (path.indexOf("/index.htm") >= 0) {
         sendHtmlPage(client);
@@ -443,95 +345,151 @@ void sendResponse(EthernetClient client, String method, String path, String body
   updateEPROM();
 }
 
-void handleSwitch(String path) {
+void switchRelays(String path) {
   /*
-    Set ALL the switches OFF
+    Set ALL the relays OFF
   */
   if (path.indexOf("all=off") > 0) {
-    setSwitch(SWITCH_A, false);
-    setSwitch(SWITCH_B, false);
+    setRelay(RELAY1, false);
+    setRelay(RELAY2, false);
+    setRelay(RELAY3, false);
+    setRelay(RELAY4, false);
   }
   /*
-     Set ALL the switches ON
+     Set ALL the relays ON
   */
   if (path.indexOf("all=on") > 0) {
-    setSwitch(SWITCH_A, true);
-    setSwitch(SWITCH_B, true);
+    setRelay(RELAY1, true);
+    setRelay(RELAY2, true);
+    setRelay(RELAY3, true);
+    setRelay(RELAY4, true);
   }
   /*
-     Now deal with individual switchs.
+     Now deal with individual relays.
 
-     We could receive: /switch?all=on&sa=off
-     which results in all switchs on except switch 1.
+     We could receive: /relay?all=on&r1=off
+     which results in all relays on except relay 1.
   */
-  if (path.indexOf("sa=on") > 0) {
-    setSwitch(SWITCH_A, true);
+  if (path.indexOf("r1=on") > 0) {
+    setRelay(RELAY1, true);
   } else {
-    if (path.indexOf("sa=off") > 0) {
-      setSwitch(SWITCH_A, false);
+    if (path.indexOf("r1=off") > 0) {
+      setRelay(RELAY1, false);
     } else {
-      if (path.indexOf("sa=inv") > 0) {
-        setSwitch(SWITCH_A, !isSwitchOn(SWITCH_A));
+      if (path.indexOf("r1=inv") > 0) {
+        setRelay(RELAY1, !isRelayOn(RELAY1));
       }
     }
   }
 
-  if (path.indexOf("sb=on") > 0) {
-    setSwitch(SWITCH_B, true);
+  if (path.indexOf("r2=on") > 0) {
+    setRelay(RELAY2, true);
   } else {
-    if (path.indexOf("sb=off") > 0) {
-      setSwitch(SWITCH_B, false);
+    if (path.indexOf("r2=off") > 0) {
+      setRelay(RELAY2, false);
     } else {
-      if (path.indexOf("sb=inv") > 0) {
-        setSwitch(SWITCH_B, !isSwitchOn(SWITCH_B));
+      if (path.indexOf("r2=inv") > 0) {
+        setRelay(RELAY2, !isRelayOn(RELAY2));
       }
     }
   }
-}
-/*
-   Return 'ON' if switch is ON else return 'OFF'
-*/
-String getSwitchStateText(int switchId) {
-  return (isSwitchOn(switchId) ? "ON" : "OFF");
-}
-/*
-   Return true if the switch is ON and false if OFF.
-*/
-bool isSwitchOn(int switchId) {
-  return getBit(switchBits, bits[switchId]);
-}
-/*
-   Set the bit is switchBits and make the Switchs the same.
-*/
-void setSwitch(int switchId, boolean on) {
-  switchBits = setBit(switchBits, on, bits[switchId]);
-  setSwitchState();
-}
 
-void setSwitchState() {
-  switch (switchBits) {
-    case B00000000:
-      servoPos(BOFF_AOFF);
-      break;
-    case B00000001:
-      servoPos(BOFF_AON);
-      break;
-    case B00000010:
-      servoPos(BON_AOFF);
-      break;
-    case B00000011:
-      servoPos(BON_AON);
-      break;
+  if (path.indexOf("r3=on") > 0) {
+    setRelay(RELAY3, true);
+  } else {
+    if (path.indexOf("r3=off") > 0) {
+      setRelay(RELAY3, false);
+    } else {
+      if (path.indexOf("r3=inv") > 0) {
+        setRelay(RELAY3, !isRelayOn(RELAY3));
+      }
+    }
   }
-  digitalWrite(LED_A_PIN, isSwitchOn(SWITCH_A));
-  digitalWrite(LED_B_PIN, isSwitchOn(SWITCH_B));
+
+  if (path.indexOf("r4=on") > 0) {
+    setRelay(RELAY4, true);
+  } else {
+    if (path.indexOf("r4=off") > 0) {
+      setRelay(RELAY4, false);
+    } else {
+      if (path.indexOf("r4=inv") > 0) {
+        setRelay(RELAY4, !isRelayOn(RELAY4));
+      }
+    }
+  }
+
 }
 
+/*
+   Return 'ON' if relay is ON else return 'OFF'
+*/
+String getRelayTextState(int relayId) {
+  return (isRelayOn(relayId) ? "ON" : "OFF");
+}
+
+/*
+   Return the required value to turn a relay ON or OFF.
+   Note: RL_ON == LOW and RL_OFF = HIGH
+*/
+int getRelayPinState(int relayId) {
+  return (isRelayOn(relayId) ? RL_ON : RL_OFF);
+}
+
+/*
+   Return true is the relay is ON and false if OFF.
+*/
+bool isRelayOn(int relayId) {
+  return getBit(relayBits, bits[relayId]);
+}
+
+/*
+   Set the actual output pin and set or clear the bit for the relay.
+*/
+void setRelay(int relayId, boolean on) {
+  relayBits = setBit(relayBits, on, bits[relayId]);
+  if (getBit(relayBits, bits[relayId])) {
+    /*
+       Set the bit then turn it ON
+    */
+    digitalWrite(pins[relayId], RL_ON);
+  } else {
+    /*
+       Clear the bit then turn it OFF
+    */
+    digitalWrite(pins[relayId], RL_OFF);
+  }
+}
+
+/*
+   Read the relay state from the EPROM when we start.
+
+   Note Un-Set EPROM locations retirn 255.
+*/
+void loadEEPROM() {
+  byte value = EEPROM.read(EEPROM_BASE);
+  if (value > 32) {
+    relayBits = 0;
+  } else {
+    relayBits = value;
+  }
+  relayBitsEEPROM = relayBits;
+  /*
+     Set the relays to match the loaded state.
+  */
+  digitalWrite(RELAY1PIN, getRelayPinState(RELAY1));
+  digitalWrite(RELAY2PIN, getRelayPinState(RELAY2));
+  digitalWrite(RELAY3PIN, getRelayPinState(RELAY3));
+  digitalWrite(RELAY4PIN, getRelayPinState(RELAY4));
+
+  sysData = EEPROM.read(EEPROM_BASE + 1);
+  sysDataEEPROM = sysData;
+  debug = getBit(sysData, DEBUG1BIT);
+}
 
 void updateEPROM() {
-  if (switchBitsEEPROM != switchBits) {
-    EEPROM.write(EEPROM_BASE, switchBits);
-    switchBitsEEPROM = switchBits;
+  if (relayBitsEEPROM != relayBits) {
+    EEPROM.write(EEPROM_BASE, relayBits);
+    relayBitsEEPROM = relayBits;
   }
 
   sysData = setBit(sysData, debug, DEBUG1BIT);
@@ -541,20 +499,24 @@ void updateEPROM() {
   }
 }
 
-void sendSwitchStatus(EthernetClient client) {
+void sendRelayStatus(EthernetClient client) {
   sendHeader(client, "200 OK");
-  voltage0  = analogRead(VOLTAGE_0_PIN) * inToVolts;
-  voltage1  = analogRead(VOLTAGE_1_PIN) * inToVolts;
-  voltage2  = analogRead(VOLTAGE_2_PIN) * inToVolts;
-  voltage3  = analogRead(VOLTAGE_3_PIN) * inToVolts;
+  voltage0  = analogRead(A0_PIN) * inToVolts;
+  voltage1  = analogRead(A1_PIN) * inToVolts;
+  voltage2  = analogRead(A2_PIN) * inToVolts;
+  voltage3  = analogRead(A3_PIN) * inToVolts;
   String content = "{\"id\":\"001\",\"up\":\"" + String(millis()) + "\",\"debug\":" + (debug ? "true" : "false") + ","
                    "\"on\":{"
-                   "\"s1\":\"" + getSwitchStateText(SWITCH_A) + "\","
-                   "\"s2\":\"" + getSwitchStateText(SWITCH_B) + "\","
-                   "\"t0\":" + vinToCelcius(voltage0) + ","
-                   "\"t1\":" + vinToCelcius(voltage1) + ","
-                   "\"v2\":" + vinToVolts(voltage2) + ","
-                   "\"v3\":" + vinToVolts(voltage3) + "}"
+                   "\"r1\":\"" + getRelayTextState(RELAY1) + "\","
+                   "\"r2\":\"" + getRelayTextState(RELAY2) + "\","
+                   "\"r3\":\"" + getRelayTextState(RELAY3) + "\","
+                   "\"r4\":\"" + getRelayTextState(RELAY4) + "\","
+                   "\"d0\":" + digitalRead(SENSE0PIN) + ","
+                   "\"d1\":" + digitalRead(SENSE1PIN) + ","
+                   "\"a0\":" + vinToCelcius(voltage0) + ","
+                   "\"a1\":" + vinToCelcius(voltage1) + ","
+                   "\"a2\":" + vinToVolts(voltage2) + ","
+                   "\"a3\":" + vinToVolts(voltage3) + "}"
                    "}";
   client.print("Content-Length: ");
   client.println(content.length());
