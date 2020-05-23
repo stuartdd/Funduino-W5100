@@ -6,6 +6,7 @@
 #include <avr/wdt.h>
 #include <Servo.h>
 
+#define DEV_ID "125"
 /*
    Define servo positions for microswitch positions
 */
@@ -77,6 +78,8 @@
    ------------------------v
 */
 #include "PrepHtmlForSketch/embedded.html.cpp"
+
+String DEV_ID_STR = DEV_ID;
 /*
    Bits defines the bit positions for each switch using an index.
 */
@@ -547,14 +550,16 @@ void sendSwitchStatus(EthernetClient client) {
   voltage1  = analogRead(VOLTAGE_1_PIN) * inToVolts;
   voltage2  = analogRead(VOLTAGE_2_PIN) * inToVolts;
   voltage3  = analogRead(VOLTAGE_3_PIN) * inToVolts;
-  String content = "{\"id\":\"001\",\"up\":\"" + String(millis()) + "\",\"debug\":" + (debug ? "true" : "false") + ","
+  String content = "{\"id\":\""+DEV_ID_STR+"\",\"up\":\"" + String(millis()) + "\",\"debug\":" + (debug ? "true" : "false") + ","
                    "\"on\":{"
-                   "\"s1\":\"" + getSwitchStateText(SWITCH_A) + "\","
-                   "\"s2\":\"" + getSwitchStateText(SWITCH_B) + "\","
+                   "\"sa\":\"" + getSwitchStateText(SWITCH_A) + "\","
+                   "\"sb\":\"" + getSwitchStateText(SWITCH_B) + "\","
+                   "\"d0\":" + "\"off\"" + ","
+                   "\"d1\":" + "\"off\"" + ","
                    "\"t0\":" + vinToCelcius(voltage0) + ","
                    "\"t1\":" + vinToCelcius(voltage1) + ","
-                   "\"v2\":" + vinToVolts(voltage2) + ","
-                   "\"v3\":" + vinToVolts(voltage3) + "}"
+                   "\"v0\":" + vinToVolts(voltage2) + ","
+                   "\"v1\":" + vinToVolts(voltage3) + "}"
                    "}";
   client.print("Content-Length: ");
   client.println(content.length());
@@ -564,7 +569,6 @@ void sendSwitchStatus(EthernetClient client) {
   if (debug) {
     Serial.println(content);
   }
-
 }
 
 void sendHtmlPage(EthernetClient client) {
@@ -587,7 +591,7 @@ void sendHtmlPage(EthernetClient client) {
 
 void sendError(EthernetClient client, String msg, String rc) {
   sendHeader(client, "200 OK");
-  String cont = "{\"id\":\"001\",\"err\":\"" + rc + "\",\"msg\":\"" + msg + "\"}";
+  String cont = "{\"id\":\""+DEV_ID_STR+"\",\"err\":\"" + rc + "\",\"msg\":\"" + msg + "\"}";
   client.print("Content-Length: ");
   client.println(cont.length());
   client.println("Content-Type: application/json");
