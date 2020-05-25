@@ -80,6 +80,8 @@
 #include "PrepHtmlForSketch/embedded.html.cpp"
 
 String DEV_ID_STR = DEV_ID;
+String DEV_A_NAME = "Heating";
+String DEV_B_NAME = "Hot Water";
 /*
    Bits defines the bit positions for each switch using an index.
 */
@@ -115,7 +117,6 @@ byte sysDataEEPROM = false;
 bool debug = false;
 
 unsigned long nextPulseFlip = 0;
-boolean pulseOn = true;
 boolean inProgress = false;
 
 float voltage0 = 0;
@@ -245,7 +246,6 @@ void setup() {
   }
   digitalWrite(LEDACTPIN, LOW);
   nextPulseFlip = millis() + PULSE_OFF;
-  pulseOn = false;
 }
 
 
@@ -504,7 +504,7 @@ bool isSwitchOn(int switchId) {
   return getBit(switchBits, bits[switchId]);
 }
 /*
-   Set the bit is switchBits and make the Switchs the same.
+   Set the bit in switchBits and make the Switchs the same.
 */
 void setSwitch(int switchId, boolean on) {
   switchBits = setBit(switchBits, on, bits[switchId]);
@@ -550,7 +550,7 @@ void sendSwitchStatus(EthernetClient client) {
   voltage1  = analogRead(VOLTAGE_1_PIN) * inToVolts;
   voltage2  = analogRead(VOLTAGE_2_PIN) * inToVolts;
   voltage3  = analogRead(VOLTAGE_3_PIN) * inToVolts;
-  String content = "{\"id\":\""+DEV_ID_STR+"\",\"up\":\"" + String(millis()) + "\",\"debug\":" + (debug ? "true" : "false") + ","
+  String content = "{\"id\":\"" + DEV_ID_STR + "\",\"up\":\"" + String(millis()) + "\",\"debug\":" + (debug ? "true" : "false") + ","
                    "\"on\":{"
                    "\"sa\":\"" + getSwitchStateText(SWITCH_A) + "\","
                    "\"sb\":\"" + getSwitchStateText(SWITCH_B) + "\","
@@ -582,7 +582,26 @@ void sendHtmlPage(EthernetClient client) {
   char c2;
   for (int k = 0; k < len; k++) {
     c1 = pgm_read_byte_near(htmlPage + k);
-    client.write(c1);
+    if (c1 == '$') {
+      k++;
+      c1 = pgm_read_byte_near(htmlPage + k);
+      switch (c1) {
+        case '0':
+          client.print(DEV_ID_STR);
+          break;
+        case '1':
+          client.print(DEV_A_NAME);
+          break;
+        case '2':
+          client.print(DEV_B_NAME);
+          break;
+        default:
+          client.write('$');
+          client.write(c1);
+      }
+    } else {
+      client.write(c1);
+    }
   }
   if (debug) {
     Serial.println("HTML index.htm. Sent");
@@ -591,7 +610,7 @@ void sendHtmlPage(EthernetClient client) {
 
 void sendError(EthernetClient client, String msg, String rc) {
   sendHeader(client, "200 OK");
-  String cont = "{\"id\":\""+DEV_ID_STR+"\",\"err\":\"" + rc + "\",\"msg\":\"" + msg + "\"}";
+  String cont = "{\"id\":\"" + DEV_ID_STR + "\",\"err\":\"" + rc + "\",\"msg\":\"" + msg + "\"}";
   client.print("Content-Length: ");
   client.println(cont.length());
   client.println("Content-Type: application/json");
