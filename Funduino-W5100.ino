@@ -159,7 +159,7 @@ long seq_led_timer = 0;
 
 const String DEV_ID_STR = DEV_ID;
 const String DEV_A_NAME = "Heating";
-const String DEV_B_NAME = "Hot Water";
+const String DEV_B_NAME = "Water";
 
 // Enter a MAC address and IP address for your controller below.
 // The IP address will be dependent on your local network:
@@ -614,9 +614,7 @@ void sendSwitchStatus(EthernetClient client) {
   voltage2  = analogRead(VOLTAGE_2_PIN) * IN_TO_VOLTS;
   voltage3  = analogRead(VOLTAGE_3_PIN) * IN_TO_VOLTS;
   String content = "{\"id\":\"" + DEV_ID_STR + "\",\"up\":\"" + String(millis()) + "\",\"debug\":" + (debug ? "true" : "false") + ","
-            "\"sa\":\"" + (M_IS_ON(SWITCH_A) ? "ON" : "OFF") + "\","
             "\"ra\":" + remainingForA + ","
-            "\"sb\":\"" + (M_IS_ON(SWITCH_B) ? "ON" : "OFF") + "\","
             "\"rb\":" + remainingForB + ","
             "\"t0\":" + M_VIN_TO_CELC(voltage0) + ","
             "\"t1\":" + M_VIN_TO_CELC(voltage1) + ","
