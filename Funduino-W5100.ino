@@ -21,8 +21,6 @@
 #define IP 192, 168, 1, 177
 #define PORT 80
 #define BAUD 115200
-#define PULSE_ON 950
-#define PULSE_OFF 50
 /*
    Define a physical pin for each function.
 */
@@ -58,34 +56,110 @@
 */
 #define SWITCH_A_BIT B00000001
 #define SWITCH_B_BIT B00000010
-#define DEBUG1BIT B00000001
 
+#define S_1_HOUR 3600
+#define S_2_HOUR 7200
+#define S_3_HOUR 10800
+#define S_24_HOUR 86400
+#define S_1_YEAR 31536000
 /*
    The address in EEP|ROM to store switchBits
    and remember the state of each switch even after a power off.
 */
-#define EEPROM_BASE 0
+#define EEPROM_DEBUG 0
+#define EEPROM_SECONDS 4
+#define EEPROM_SECONDS_A 8
+#define EEPROM_SECONDS_B 12
+
 
 #define WDT_DELAY 4000
-#define BTN_TIMER_DELAY 50
-#define SERVO_PWR_DELAY 1000
-/**
+#define BTN_TIMER_DELAY 100
+#define SERVO_PWR_DELAY 1030
+#define CLEAR_BUTTON_DELAY 700
+#define UPDATE_SWITCH_DELAY 900
+
+/*
+   Constants for Temppreture chip MCP9701 and Voltage conversion
+*/
+#define TEMP_CONST (float)19.53   // mV for °C temperature constant for the  MCP9701/A
+#define VOUT_MV_Z (float)400      //  sensor output voltage in mV at 0°C (400 * 1000)
+#define IN_TO_VOLTS (float)4.814  // (Vref  / 1024) * 1000
+
+#define HTTP_200 "HTTP/1.1 200 OK"
+#define HTTP_CONTENT_LEN "Content-Length: "
+#define HTTP_CONTENT_TYPE_JSON "Content-Type: application/json"
+#define HTTP_CONTENT_TYPE_HTML "Content-Type: text/html"
+
+/*
+   Define CODE macros.
+   Used to inline code and reduce the call stack while declaring function once.
+*/
+#define M_REMAINING_SEC(id)(M_IS_ON(id) ? secondsToOffAB[id] - last_seconds : 0)
+#define M_VIN_TO_CELC(vIn)((vIn - VOUT_MV_Z) / TEMP_CONST)
+#define M_IS_ON(id)((last_seconds < secondsToOffAB[id]))
+#define M_SET_SEC(id, sec)(secondsToOffAB[id] = (sec > 0 ? last_seconds + sec : 0))
+#define M_EEPROM_LONG(addr, val)({ \
+    EEPROM.write(addr, (val & 0xFF)); \
+    EEPROM.write(addr + 1, ((val >> 8) & 0xFF)); \
+    EEPROM.write(addr + 2, ((val >> 16) & 0xFF)); \
+    EEPROM.write(addr + 3, ((val >> 24) & 0xFF)); \
+  })
+
+#define M_SET_OFF(id) ({ \
+    M_SET_SEC(id, 0); \
+    M_EEPROM_LONG(offsetToEEPROM[id], secondsToOffAB[id]); \
+  })
+
+#define M_SET_ON(id, sec)({ \
+    M_SET_SEC(id,sec); \
+    M_EEPROM_LONG(offsetToEEPROM[id], secondsToOffAB[id]); \
+  })
+
+
+#define M_SET_INV(id)({ \
+    if (M_IS_ON(id)) { \
+      M_SET_SEC(id,0); \
+    } else { \
+      M_SET_SEC(id,S_24_HOUR); \
+    } \
+    M_EEPROM_LONG(offsetToEEPROM[id], secondsToOffAB[id]); \
+  })
+
+typedef enum REQ_DATA {
+  Heading,
+  ContentLen,
+  Path,
+  Body,
+  Skip
+};
+/*
    Read the HTML/JavaScript String value.
    It is stored in FLASH memory along with the code.
 
    On Linux it needs to be /
-   On Windows it needs to be \
-   ------------------------v
+   On Windows it needs to be \\
 */
-#include "PrepHtmlForSketch/embedded.html.cpp"
 
-String DEV_ID_STR = DEV_ID;
-String DEV_A_NAME = "Heating";
-String DEV_B_NAME = "Hot Water";
+#include "PrepHtmlForSketch/embedded.html.cpp"
 /*
-   Bits defines the bit positions for each switch using an index.
+   Light flash sequence.
 */
-byte bits[] = {SWITCH_A_BIT, SWITCH_B_BIT};
+#define SEQ_LEN 10
+#define SEQ_3H 0
+#define SEQ_2H 2
+#define SEQ_1H 4
+#define SEQ_ON 6
+#define SEQ_TIME 200
+const int seqOut[] = {HIGH, LOW, HIGH, LOW, HIGH, LOW, HIGH, HIGH, HIGH, HIGH};
+int seq_index_sw_a = SEQ_ON;
+int seq_index_sw_b = SEQ_ON;
+int seq_base_sw_a = SEQ_ON;
+int seq_base_sw_b = SEQ_ON;
+long seq_led_timer = 0;
+
+const String DEV_ID_STR = DEV_ID;
+const String DEV_A_NAME = "Heating";
+const String DEV_B_NAME = "Hot Water";
 
 // Enter a MAC address and IP address for your controller below.
 // The IP address will be dependent on your local network:
@@ -101,22 +175,9 @@ EthernetServer server(PORT);
 Servo servoMotor;
 int servoPosition;
 
-/*
-   The state of each switch is held in the bits of this byte.
-   See SWITCH_A_BIT to SWITCH_B_BIT above to find the bits.
-
-   The switchBitsEEPROM is used to mirror what is is in EEPROM
-   If these are different then updateEPROM will store the value
-   of switchBits and update the value of switchBitsEEPROM.
-*/
-byte switchBits = 0;
-byte switchBitsEEPROM = 0;
-
-byte sysData = false;
-byte sysDataEEPROM = false;
+byte currentSwitchState = 0;
 bool debug = false;
 
-unsigned long nextPulseFlip = 0;
 boolean inProgress = false;
 
 float voltage0 = 0;
@@ -124,118 +185,60 @@ float voltage1 = 0;
 float voltage2 = 0;
 float voltage3 = 0;
 
-/*
-   Analog constants
-*/
-const float inToVolts = 4.814;  // (Vref  / 1024) * 1000
-/*
-   Constants for Temppreture chip MCP9701
-*/
-const float vout0 = 400;        //  sensor output voltage in mV at 0°C (400 * 1000)
-const float tc = 19.53;         // mV for °C temperature constant for the  MCP9701/A
 
-
-typedef enum READING {
-  Heading,
-  ContentLen,
-  Path,
-  Body,
-  Skip
-};
-
+long offsetToEEPROM[] = {EEPROM_SECONDS_A, EEPROM_SECONDS_B};
+long secondsToOffAB[] = {0, 0};
+long remainingForA = 0;
+long remainingForB = 0;
 long loop_time = 0;
 long timer_wdt = 0;
+long last_seconds_set_time = 0;
+long last_seconds_diff = 0;
+long last_seconds_temp = 0;
+long last_seconds_offset = 0;
+long last_seconds = 0;
 long button_timer = 0;
+long updateSwitchTimer = 0;
+long buttonClearTimerA = 0;
+long buttonClearTimerB = 0;
 long servo_pwr_timer = 0;
-
 bool servo_pwr_on = false;
 bool button_a_pressed = false;
 bool button_b_pressed = false;
+int buttonStateAB[] = {0, 0};
 
-
-void digitalPins() {
-  pinMode(LEDACTPIN, OUTPUT);
-  digitalWrite(LEDACTPIN, LOW);
-  pinMode(LED_A_PIN, OUTPUT);
-  digitalWrite(LEDACTPIN, LOW);
-  pinMode(LED_B_PIN, OUTPUT);
-  digitalWrite(LED_B_PIN, LOW);
-  pinMode(BTN_A_PIN, INPUT_PULLUP);
-  pinMode(BTN_B_PIN, INPUT_PULLUP);
-  // Init analog pins for sensor input
-  pinMode(D4_PIN, INPUT_PULLUP);
-  pinMode(D5_PIN, INPUT_PULLUP);
-  pinMode(D6_PIN, INPUT_PULLUP);
-  pinMode(D7_PIN, INPUT_PULLUP);
-}
-
-void servoInit() {
-  servoMotor.attach(SERVO1PIN);
-  setSwitchState();
-  pinMode(EN_SV_PIN, OUTPUT);
-  digitalWrite(EN_SV_PIN, HIGH);
-}
-
-void servoPos(int pos) {
-  if (servoPosition != pos) {
-    /*
-       Power up the servo.
-       Flag it as ON
-       Set a timer to turn it off
-    */
-    digitalWrite(EN_SV_PIN, HIGH);
-    servo_pwr_on = true;
-    servo_pwr_timer = millis() + SERVO_PWR_DELAY;
-    if (debug) {
-      Serial.print(millis());
-      Serial.print(": Servo PWR ON :");
-      Serial.println(servo_pwr_timer);
-    }
-    /*
-       Set the position of the servo
-    */
-    servoPosition = pos;
-    delay(1);
-    servoMotor.write(pos);
-  }
-}
-/*
-   Read the switch state from the EPROM when we start.
-
-   Note Un-Set EPROM locations retirn 255.
-*/
-void loadEEPROM() {
-  byte value = EEPROM.read(EEPROM_BASE);
-  if (value > 32) {
-    switchBits = 0;
-  } else {
-    switchBits = value;
-  }
-  switchBitsEEPROM = switchBits;
-  /*
-     Set the switches to match the loaded state.
-  */
-
-  sysData = EEPROM.read(EEPROM_BASE + 1);
-  sysDataEEPROM = sysData;
-  debug = getBit(sysData, DEBUG1BIT);
-}
 
 void setup() {
   wdt_enable(WDTO_8S);
-  loadEEPROM();
-  /*
-    Read the switch state from the EPROM
-  */
-  digitalPins();
-  servoInit();
-
   // Open serial communications and wait for port to open:
   Serial.begin(BAUD);
   while (!Serial) {
     ; // wait for serial port to connect. Needed for Leonardo only
   }
 
+  loadEEPROM();
+
+  /*
+    Read the switch state from the EPROM
+  */
+  digitalPins();
+
+  if (!digitalRead(BTN_A_PIN) || !digitalRead(BTN_B_PIN)) {
+    last_seconds = 0;
+    debug = digitalRead(BTN_B_PIN);
+    EEPROM.write(EEPROM_DEBUG, debug);
+    M_SET_OFF(SWITCH_A);
+    M_SET_OFF(SWITCH_B);
+  }
+
+  while (!digitalRead(BTN_A_PIN) || !digitalRead(BTN_B_PIN)) {
+    delay(100);
+    digitalWrite(LEDACTPIN, HIGH);
+    delay(100);
+    digitalWrite(LEDACTPIN, LOW);
+  }
+
+  servoInit();
 
   // start the Ethernet connection and the server:
   Ethernet.begin(mac, ip);
@@ -245,12 +248,35 @@ void setup() {
     Serial.println(Ethernet.localIP());
   }
   digitalWrite(LEDACTPIN, LOW);
-  nextPulseFlip = millis() + PULSE_OFF;
+  last_seconds_set_time = millis();
 }
 
 
 void loop() {
   loop_time = millis();
+  /*
+     Check for wrap around millis
+  */
+  if (loop_time < last_seconds_set_time) {
+    last_seconds_set_time = millis();
+  }
+  /*
+     Count seconds!
+  */
+  if (loop_time > (last_seconds_set_time + 1000)) {
+    last_seconds_offset = loop_time - last_seconds_set_time;
+    last_seconds_set_time = loop_time;
+    last_seconds_diff = last_seconds_diff + last_seconds_offset;
+    last_seconds_temp = last_seconds_diff / 1000;
+    last_seconds = last_seconds + last_seconds_temp;
+    last_seconds_diff = last_seconds_diff - (last_seconds_temp * 1000);
+    if (last_seconds_temp > 0) {
+      M_EEPROM_LONG(EEPROM_SECONDS, last_seconds);
+    }
+  }
+  /*
+     Reset if we dont get here in time!
+  */
   if (loop_time > timer_wdt) {
     timer_wdt = loop_time + WDT_DELAY;
     if (!inProgress) {
@@ -263,44 +289,61 @@ void loop() {
       if (debug) {
         Serial.print(millis());
         Serial.println(": InProgress:");
-
       }
     }
   }
-
-
+  /*
+     Only look at the buttons every BTN_TIMER_DELAY ms
+  */
   if (loop_time > button_timer) {
     button_timer = loop_time + BTN_TIMER_DELAY;
     if (!digitalRead(BTN_A_PIN)) {
       if (!button_a_pressed) {
+        seq_base_sw_a = SEQ_ON;
         button_a_pressed = true;
-        if (debug) {
-          Serial.println("BUTTON A");
-        }
-        setSwitch(SWITCH_A, !isSwitchOn(SWITCH_A));
+        buttonClearTimerA = loop_time + CLEAR_BUTTON_DELAY;
+        buttonStateAB[SWITCH_A]++;
+        setTimeToOff(SWITCH_A);
       }
     } else {
       button_a_pressed = false;
+      if ((buttonClearTimerA > 0) && (loop_time > buttonClearTimerA)) {
+        buttonStateAB[SWITCH_A] = 0;
+        buttonClearTimerA = 0;
+      }
     }
     if (!digitalRead(BTN_B_PIN)) {
       if (!button_b_pressed) {
+        seq_base_sw_b = SEQ_ON;
         button_b_pressed = true;
-        if (debug) {
-          Serial.println("BUTTON B");
-        }
-        setSwitch(SWITCH_B, !isSwitchOn(SWITCH_B));
+        buttonClearTimerB = loop_time + CLEAR_BUTTON_DELAY;
+        buttonStateAB[SWITCH_B]++;
+        setTimeToOff(SWITCH_B);
       }
     } else {
       button_b_pressed = false;
+      if ((buttonClearTimerB > 0) && (loop_time > buttonClearTimerB)) {
+        buttonStateAB[SWITCH_B] = 0;
+        buttonClearTimerB = 0;
+      }
     }
   }
-
+  /*
+     Do we need to tourn on the heating/hot water
+  */
+  if (loop_time > updateSwitchTimer) {
+    updateSwitchTimer = loop_time + UPDATE_SWITCH_DELAY;
+    remainingForA = M_REMAINING_SEC(SWITCH_A);
+    remainingForB = M_REMAINING_SEC(SWITCH_B);
+    setSwitchState();
+  }
   /*
      If servo power is ON and it is time to turn it OFF
   */
   if ((servo_pwr_on) && (loop_time > servo_pwr_timer)) {
     servo_pwr_on = false;
     digitalWrite(EN_SV_PIN, LOW);
+    digitalWrite(LEDACTPIN, LOW);
     if (debug) {
       Serial.println(": Servo PWR OFF :");
     }
@@ -312,7 +355,7 @@ void loop() {
     // an http request ends with a blank line
     boolean currentLineIsBlank = true;
 
-    READING state = Heading;
+    REQ_DATA state = Heading;
 
     String header = "";
     String contentLength = "";
@@ -378,7 +421,6 @@ void loop() {
                   state = Skip;
                 }
                 break;
-
             } // end switch
           } // end if c >= ' '
         } // end else
@@ -398,8 +440,10 @@ void loop() {
 
     if (path.indexOf("/debugon") >= 0) {
       debug = true;
+      EEPROM.write(EEPROM_DEBUG, debug);
     } else if (path.indexOf("/debugoff") >= 0) {
       debug = false;
+      EEPROM.write(EEPROM_DEBUG, debug);
     }
 
     if (debug) {
@@ -420,6 +464,50 @@ void loop() {
     digitalWrite(LEDACTPIN, LOW);
     if (debug) {
       Serial.println("Connection Closed");
+    }
+  }
+
+  if (loop_time > seq_led_timer) {
+    seq_led_timer = loop_time + SEQ_TIME;
+
+    if (M_IS_ON(SWITCH_A)) {
+      seq_index_sw_a++;
+      if (seq_index_sw_a >= SEQ_LEN) {
+        seq_index_sw_a = seq_base_sw_a;
+      }
+      digitalWrite(LED_A_PIN, seqOut[seq_index_sw_a]);
+      if (remainingForA < S_1_HOUR) {
+        seq_base_sw_a = SEQ_1H;
+      } else if (remainingForA < S_2_HOUR) {
+        seq_base_sw_a = SEQ_2H;
+      } else if (remainingForA < S_3_HOUR) {
+        seq_base_sw_a = SEQ_3H;
+      } else {
+        seq_base_sw_a = SEQ_ON;
+      }
+    } else {
+      digitalWrite(LED_A_PIN, LOW);
+      seq_base_sw_a = SEQ_ON;
+    }
+
+    if (M_IS_ON(SWITCH_B)) {
+      seq_index_sw_b++;
+      if (seq_index_sw_b >= SEQ_LEN) {
+        seq_index_sw_b = seq_base_sw_b;
+      }
+      digitalWrite(LED_B_PIN, seqOut[seq_index_sw_b]);
+      if (remainingForB < S_1_HOUR) {
+        seq_base_sw_b = SEQ_1H;
+      } else if (remainingForB < S_2_HOUR) {
+        seq_base_sw_b = SEQ_2H;
+      } else if (remainingForB < S_3_HOUR) {
+        seq_base_sw_b = SEQ_3H;
+      } else {
+        seq_base_sw_b = SEQ_ON;
+      }
+    } else {
+      digitalWrite(LED_B_PIN, LOW);
+      seq_base_sw_b = SEQ_ON;
     }
   }
 }
@@ -443,7 +531,6 @@ void sendResponse(EthernetClient client, String method, String path, String body
   }
   client.println("");
   client.flush();
-  updateEPROM();
 }
 
 void handleSwitch(String path) {
@@ -451,15 +538,15 @@ void handleSwitch(String path) {
     Set ALL the switches OFF
   */
   if (path.indexOf("all=off") > 0) {
-    setSwitch(SWITCH_A, false);
-    setSwitch(SWITCH_B, false);
+    M_SET_OFF(SWITCH_A);
+    M_SET_OFF(SWITCH_B);
   }
   /*
      Set ALL the switches ON
   */
   if (path.indexOf("all=on") > 0) {
-    setSwitch(SWITCH_A, true);
-    setSwitch(SWITCH_B, true);
+    M_SET_ON(SWITCH_A, S_24_HOUR);
+    M_SET_ON(SWITCH_B, S_24_HOUR);
   }
   /*
      Now deal with individual switchs.
@@ -468,51 +555,44 @@ void handleSwitch(String path) {
      which results in all switchs on except switch 1.
   */
   if (path.indexOf("sa=on") > 0) {
-    setSwitch(SWITCH_A, true);
+    M_SET_ON(SWITCH_A, S_24_HOUR);
   } else {
     if (path.indexOf("sa=off") > 0) {
-      setSwitch(SWITCH_A, false);
+      M_SET_OFF(SWITCH_A);
     } else {
       if (path.indexOf("sa=inv") > 0) {
-        setSwitch(SWITCH_A, !isSwitchOn(SWITCH_A));
+        M_SET_INV(SWITCH_A);
       }
     }
   }
 
   if (path.indexOf("sb=on") > 0) {
-    setSwitch(SWITCH_B, true);
+    M_SET_ON(SWITCH_B, S_24_HOUR);
   } else {
     if (path.indexOf("sb=off") > 0) {
-      setSwitch(SWITCH_B, false);
+      M_SET_OFF(SWITCH_B);
     } else {
       if (path.indexOf("sb=inv") > 0) {
-        setSwitch(SWITCH_B, !isSwitchOn(SWITCH_B));
+        M_SET_INV(SWITCH_B);
       }
     }
   }
 }
-/*
-   Return 'ON' if switch is ON else return 'OFF'
-*/
-String getSwitchStateText(int switchId) {
-  return (isSwitchOn(switchId) ? "ON" : "OFF");
-}
-/*
-   Return true if the switch is ON and false if OFF.
-*/
-bool isSwitchOn(int switchId) {
-  return getBit(switchBits, bits[switchId]);
-}
-/*
-   Set the bit in switchBits and make the Switchs the same.
-*/
-void setSwitch(int switchId, boolean on) {
-  switchBits = setBit(switchBits, on, bits[switchId]);
-  setSwitchState();
-}
 
 void setSwitchState() {
-  switch (switchBits) {
+  int bits = 0;
+  if (M_IS_ON(SWITCH_A)) {
+    bits = bits | SWITCH_A_BIT;
+  }
+  if M_IS_ON(SWITCH_B) {
+    bits = bits | SWITCH_B_BIT;
+  }
+  if (currentSwitchState == bits) {
+    return;
+  }
+  currentSwitchState = bits;
+
+  switch (bits) {
     case B00000000:
       servoPos(BOFF_AOFF);
       break;
@@ -526,57 +606,41 @@ void setSwitchState() {
       servoPos(BON_AON);
       break;
   }
-  digitalWrite(LED_A_PIN, isSwitchOn(SWITCH_A));
-  digitalWrite(LED_B_PIN, isSwitchOn(SWITCH_B));
-}
-
-
-void updateEPROM() {
-  if (switchBitsEEPROM != switchBits) {
-    EEPROM.write(EEPROM_BASE, switchBits);
-    switchBitsEEPROM = switchBits;
-  }
-
-  sysData = setBit(sysData, debug, DEBUG1BIT);
-  if (sysDataEEPROM != sysData) {
-    EEPROM.write(EEPROM_BASE + 1, sysData);
-    sysDataEEPROM = sysData;
-  }
 }
 
 void sendSwitchStatus(EthernetClient client) {
-  sendHeader(client, "200 OK");
-  voltage0  = analogRead(VOLTAGE_0_PIN) * inToVolts;
-  voltage1  = analogRead(VOLTAGE_1_PIN) * inToVolts;
-  voltage2  = analogRead(VOLTAGE_2_PIN) * inToVolts;
-  voltage3  = analogRead(VOLTAGE_3_PIN) * inToVolts;
+  voltage0  = analogRead(VOLTAGE_0_PIN) * IN_TO_VOLTS;
+  voltage1  = analogRead(VOLTAGE_1_PIN) * IN_TO_VOLTS;
+  voltage2  = analogRead(VOLTAGE_2_PIN) * IN_TO_VOLTS;
+  voltage3  = analogRead(VOLTAGE_3_PIN) * IN_TO_VOLTS;
   String content = "{\"id\":\"" + DEV_ID_STR + "\",\"up\":\"" + String(millis()) + "\",\"debug\":" + (debug ? "true" : "false") + ","
-                   "\"on\":{"
-                   "\"sa\":\"" + getSwitchStateText(SWITCH_A) + "\","
-                   "\"sb\":\"" + getSwitchStateText(SWITCH_B) + "\","
-                   "\"d0\":" + "\"off\"" + ","
-                   "\"d1\":" + "\"off\"" + ","
-                   "\"t0\":" + vinToCelcius(voltage0) + ","
-                   "\"t1\":" + vinToCelcius(voltage1) + ","
-                   "\"v0\":" + vinToVolts(voltage2) + ","
-                   "\"v1\":" + vinToVolts(voltage3) + "}"
-                   "}";
-  client.print("Content-Length: ");
+            "\"sa\":\"" + (M_IS_ON(SWITCH_A) ? "ON" : "OFF") + "\","
+            "\"ra\":" + remainingForA + ","
+            "\"sb\":\"" + (M_IS_ON(SWITCH_B) ? "ON" : "OFF") + "\","
+            "\"rb\":" + remainingForB + ","
+            "\"t0\":" + M_VIN_TO_CELC(voltage0) + ","
+            "\"t1\":" + M_VIN_TO_CELC(voltage1) + ","
+            "\"v0\":" + (voltage2 / 1000) + ","
+            "\"v1\":" + (voltage3 / 1000) +
+            "}";
+  client.println(HTTP_200);
+  client.print(HTTP_CONTENT_LEN);
   client.println(content.length());
-  client.println("Content-Type: application/json");
+  client.println(HTTP_CONTENT_TYPE_JSON);
   client.println("");
   client.println(content);
   if (debug) {
+    Serial.print("[");
     Serial.println(content);
   }
 }
 
 void sendHtmlPage(EthernetClient client) {
-  sendHeader(client, "200 OK");
   int len = strlen_P(htmlPage);
-  client.print("Content-Length: ");
+  client.println(HTTP_200);
+  client.print(HTTP_CONTENT_LEN);
   client.println(len);
-  client.println("Content-Type: text/html");
+  client.println(HTTP_CONTENT_TYPE_HTML);
   client.println("");
   char c1;
   char c2;
@@ -609,11 +673,11 @@ void sendHtmlPage(EthernetClient client) {
 }
 
 void sendError(EthernetClient client, String msg, String rc) {
-  sendHeader(client, "200 OK");
   String cont = "{\"id\":\"" + DEV_ID_STR + "\",\"err\":\"" + rc + "\",\"msg\":\"" + msg + "\"}";
-  client.print("Content-Length: ");
+  client.println(HTTP_200);
+  client.print(HTTP_CONTENT_LEN);
   client.println(cont.length());
-  client.println("Content-Type: application/json");
+  client.println(HTTP_CONTENT_TYPE_JSON);
   client.println("");
   client.println(cont);
   if (debug) {
@@ -621,43 +685,90 @@ void sendError(EthernetClient client, String msg, String rc) {
   }
 }
 
-void sendHeader(EthernetClient client, String statusCode) {
-  client.print("HTTP/1.1 ");
-  client.println(statusCode);
-  if (debug) {
-    Serial.println("HTTP/1.1 " + statusCode);
+void setTimeToOff(int switchId) {
+  switch (buttonStateAB[switchId]) {
+    case 1:
+      M_SET_ON(switchId, S_1_HOUR);
+      break;
+    case 2:
+      M_SET_ON(switchId, S_2_HOUR);
+      break;
+    case 3:
+      M_SET_ON(switchId, S_3_HOUR);
+      break;
+    default:
+      buttonStateAB[switchId] = 0;
+      M_SET_OFF(switchId);
+      break;
   }
 }
 
-byte setBit(byte byteIn, bool on, byte byteBit) {
-  if (on) {
+void servoPos(int pos) {
+  if (servoPosition != pos) {
     /*
-       Set the bit to 1
+       Power up the servo.
+       Flag it as ON
+       Set a timer to turn it off
     */
-    return byteIn | byteBit;
-  } else {
+    digitalWrite(EN_SV_PIN, HIGH);
+    digitalWrite(LEDACTPIN, HIGH);
+    servo_pwr_on = true;
+    servo_pwr_timer = millis() + SERVO_PWR_DELAY;
+    if (debug) {
+      Serial.print(millis());
+      Serial.println(": Servo PWR ON :");
+    }
     /*
-       Clear the bit (0)
+       Set the position of the servo
     */
-    return byteIn & ~byteBit;
+    servoPosition = pos;
+    delay(1);
+    servoMotor.write(pos);
   }
 }
 
-bool getBit(byte byteIn, byte byteBit) {
-  return ((byteIn & byteBit) != 0);
+void digitalPins() {
+  pinMode(LEDACTPIN, OUTPUT);
+  digitalWrite(LEDACTPIN, LOW);
+  pinMode(LED_A_PIN, OUTPUT);
+  digitalWrite(LEDACTPIN, LOW);
+  pinMode(LED_B_PIN, OUTPUT);
+  digitalWrite(LED_B_PIN, LOW);
+  pinMode(BTN_A_PIN, INPUT_PULLUP);
+  pinMode(BTN_B_PIN, INPUT_PULLUP);
+  // Init analog pins for sensor input
+  pinMode(D4_PIN, INPUT_PULLUP);
+  pinMode(D5_PIN, INPUT_PULLUP);
+  pinMode(D6_PIN, INPUT_PULLUP);
+  pinMode(D7_PIN, INPUT_PULLUP);
 }
 
-float vinToCelcius(float vIn) {
-  float celc = (vIn - vout0) / tc ;
-  if (debug) {
-    Serial.print("Temp: vIn: ");
-    Serial.print(vIn);
-    Serial.print(" celc: ");
-    Serial.println(celc);
+void servoInit() {
+  servoMotor.attach(SERVO1PIN);
+  pinMode(EN_SV_PIN, OUTPUT);
+  digitalWrite(EN_SV_PIN, LOW);
+  digitalWrite(LEDACTPIN, LOW);
+}
+/*
+   Read the switch state from the EPROM when we start.
+
+   Note Un-Set EPROM locations retirn 255.
+*/
+void loadEEPROM() {
+  last_seconds = EEPROMReadlong(EEPROM_SECONDS);
+  secondsToOffAB[SWITCH_A] = EEPROMReadlong(EEPROM_SECONDS_A);
+  secondsToOffAB[SWITCH_B] = EEPROMReadlong(EEPROM_SECONDS_B);
+  debug = EEPROM.read(EEPROM_DEBUG);
+}
+
+long EEPROMReadlong(long address) {
+  long four = EEPROM.read(address);
+  long three = EEPROM.read(address + 1);
+  long two = EEPROM.read(address + 2);
+  long one = EEPROM.read(address + 3);
+  long v = ((four << 0) & 0xFF) + ((three << 8) & 0xFFFF) + ((two << 16) & 0xFFFFFF) + ((one << 24) & 0xFFFFFFFF);
+  if ((v < 0) || (v > S_1_YEAR)) {
+    return 0;
   }
-  return celc;
-}
-
-float vinToVolts(float vIn) {
-  return vIn / 1000;
+  return v;
 }
