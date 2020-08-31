@@ -21,7 +21,7 @@ This may not be required but is probably a good idea!
 ```bash
 mkdir git
 cd git
-git clone https://github.com/<user>/Funduino-W5100.git
+git clone https://github.com/stuartdd/Funduino-W5100.git
 ```
 ## Launch the IDE
 ### Open the ino file
