@@ -70,16 +70,26 @@ java -cp build/classes prephtmlforsketch.PrepHtmlForSketch config.properties ^C
 Configure: The Java program via __config.properties__
 
 ```properties
+name.2=htmlPage
 htmlPage.filename=embedded.html
 htmlPage.nl=false
 htmlPage.wrap=const char htmlPage[] PROGMEM = %%;
 ```
-* htmlPage.filename
-** Defines the input file name (embedded.html) and the output file name (embedded.html.cpp)
-* htmlPage.nl
-** Will add new lines '\n' if true.This is usefull for debugging in the browser.
-* htmlPage.wrap
-** The line the resultant html is wraped in to (replacing %%). 
+* name.n=[prefix]
+  * You can process multiple files where name.n defines the properties for a given process.
+  * For example:
+    * name.1=__htmlFile1__
+    * name.2=__htmlFile2__
+    * would require __htmlFile1__.filename, __htmlFile1__.nl, __htmlFile1__.wrap, __htmlFile2__.filename, __htmlFile2__.nl and __htmlFile2__.wrap to be defined.
+  * The outcome would be __two__ input files and __two__ output files.
+* [prefix].filename
+  * Defines the input file name (embedded.html) and the output file name (embedded.html.cpp)
+* [prefix].nl
+  * Will add new lines '\n' if true.This is usefull for debugging in the browser.
+* [prefix].wrap
+  * The line the resultant html is wraped in to (replacing %%).
+  
+__Note: the prefix (and all values on the left of the '=') must NOT contain space characters.__
 
 ## Prototype layout:
 ![Prototype pic](https://github.com/stuartdd/Funduino-W5100/blob/master/pic001.png)
