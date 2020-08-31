@@ -125,7 +125,7 @@
     M_EEPROM_LONG(offsetToEEPROM[id], secondsToOffAB[id]); \
   })
 
-typedef enum REQ_DATA {
+enum REQ_DATA {
   Heading,
   ContentLen,
   Path,

@@ -108,7 +108,8 @@ public class PrepHtmlForSketch {
         }
     }
 
-    private static void processLine(String l, StringBuilder sb, boolean appendNL) {
+    private static void processLine(String lineIn, StringBuilder sb, boolean appendNL) {
+        String l = trimEnd(lineIn);
         StringBuilder lin1 = new StringBuilder();
         for (char c : l.toCharArray()) {
             if (c == '"') {
@@ -139,6 +140,15 @@ public class PrepHtmlForSketch {
         }
     }
 
+    private static String trimEnd(String value) {
+        int len = value.length();
+        int st = 0;
+        while ((st < len) && value.charAt(len - 1) <= ' ') {
+            len--;
+        }
+        return value.substring(0, len);
+    }
+    
     private static boolean getBoolean(String key, boolean defaultValue) {
         String v = prop.getProperty(key, Boolean.toString(defaultValue));
         return v.equalsIgnoreCase("true");
