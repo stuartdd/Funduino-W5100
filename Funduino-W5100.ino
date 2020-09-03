@@ -1,6 +1,7 @@
 
 #include <SPI.h>
 #include <Ethernet.h>
+#include <EthernetUdp.h>
 #include <avr/pgmspace.h>
 #include <EEPROM.h>
 #include <avr/wdt.h>
@@ -19,6 +20,9 @@
 
 #define MAC 0x34, 0xA9, 0x5D, 0x09, 0xCF, 0xED
 #define IP 192, 168, 1, 177
+#define GATEWAY 192, 168, 1, 1
+#define SUBNET 255, 255, 255, 0
+#define NTP_IP 129,6,15,30
 #define PORT 80
 #define BAUD 115200
 /*
@@ -61,16 +65,11 @@
 #define S_2_HOUR 7200
 #define S_3_HOUR 10800
 #define S_24_HOUR 86400
-#define S_1_YEAR 31536000
-/*
-   The address in EEP|ROM to store switchBits
-   and remember the state of each switch even after a power off.
-*/
-#define EEPROM_DEBUG 0
-#define EEPROM_SECONDS 4
-#define EEPROM_SECONDS_A 8
-#define EEPROM_SECONDS_B 12
 
+#define S_1_BOOST 3600
+#define S_2_BOOST 7200
+#define S_3_BOOST 10800
+#define S_24_BOOST 86400
 
 #define WDT_DELAY 4000
 #define BTN_TIMER_DELAY 100
@@ -88,42 +87,13 @@
 #define HTTP_200 "HTTP/1.1 200 OK"
 #define HTTP_CONTENT_LEN "Content-Length: "
 #define HTTP_CONTENT_TYPE_JSON "Content-Type: application/json"
-#define HTTP_CONTENT_TYPE_HTML "Content-Type: text/html"
 
 /*
    Define CODE macros.
    Used to inline code and reduce the call stack while declaring function once.
 */
-#define M_REMAINING_SEC(id)(M_IS_ON(id) ? secondsToOffAB[id] - last_seconds : 0)
 #define M_VIN_TO_CELC(vIn)((vIn - VOUT_MV_Z) / TEMP_CONST)
-#define M_IS_ON(id)((last_seconds < secondsToOffAB[id]))
-#define M_SET_SEC(id, sec)(secondsToOffAB[id] = (sec > 0 ? last_seconds + sec : 0))
-#define M_EEPROM_LONG(addr, val)({ \
-    EEPROM.write(addr, (val & 0xFF)); \
-    EEPROM.write(addr + 1, ((val >> 8) & 0xFF)); \
-    EEPROM.write(addr + 2, ((val >> 16) & 0xFF)); \
-    EEPROM.write(addr + 3, ((val >> 24) & 0xFF)); \
-  })
 
-#define M_SET_OFF(id) ({ \
-    M_SET_SEC(id, 0); \
-    M_EEPROM_LONG(offsetToEEPROM[id], secondsToOffAB[id]); \
-  })
-
-#define M_SET_ON(id, sec)({ \
-    M_SET_SEC(id,sec); \
-    M_EEPROM_LONG(offsetToEEPROM[id], secondsToOffAB[id]); \
-  })
-
-
-#define M_SET_INV(id)({ \
-    if (M_IS_ON(id)) { \
-      M_SET_SEC(id,0); \
-    } else { \
-      M_SET_SEC(id,S_24_HOUR); \
-    } \
-    M_EEPROM_LONG(offsetToEEPROM[id], secondsToOffAB[id]); \
-  })
 
 enum REQ_DATA {
   Heading,
@@ -132,45 +102,53 @@ enum REQ_DATA {
   Body,
   Skip
 };
-/*
-   Read the HTML/JavaScript String value.
-   It is stored in FLASH memory along with the code.
 
-   On Linux it needs to be /
-   On Windows it needs to be \\
-*/
-
-#include "PrepHtmlForSketch/embedded.html.cpp"
 /*
    Light flash sequence.
 */
-#define SEQ_LEN 10
+#define SEQ_STEPS 9
 #define SEQ_3H 0
 #define SEQ_2H 2
 #define SEQ_1H 4
-#define SEQ_ON 6
+#define SEQ_OFF 6
 #define SEQ_TIME 200
-const int seqOut[] = {HIGH, LOW, HIGH, LOW, HIGH, LOW, HIGH, HIGH, HIGH, HIGH};
-int seq_index_sw_a = SEQ_ON;
-int seq_index_sw_b = SEQ_ON;
-int seq_base_sw_a = SEQ_ON;
-int seq_base_sw_b = SEQ_ON;
+
+const int seqOut[] = {HIGH, LOW, HIGH, LOW, HIGH, LOW, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH};
+int seq_step_all = 0;
+
+int seq_base_sw_a = SEQ_OFF;
+int seq_index_sw_a = SEQ_OFF;
+int seq_base_sw_b = SEQ_OFF;
+int seq_index_sw_b = SEQ_OFF;
+
 long seq_led_timer = 0;
 
 const String DEV_ID_STR = DEV_ID;
 const String DEV_A_NAME = "Heating";
 const String DEV_B_NAME = "Water";
+const String DEV_T_A_ID = "ta";
+const String DEV_T_B_ID = "tb";
+const String DEV_S_A_ID = "sa";
+const String DEV_S_B_ID = "sb";
+
 
 // Enter a MAC address and IP address for your controller below.
 // The IP address will be dependent on your local network:
-byte mac[] = {MAC};
+const byte mac[] = {MAC};
 
 IPAddress ip(IP);
+IPAddress subnet(SUBNET);
+IPAddress gateway(GATEWAY);
+IPAddress timeSrvr(NTP_IP);
 
 // Initialize the Ethernet server library
 // with the IP address and port you want to use
 // (port 80 is default for HTTP):
 EthernetServer server(PORT);
+
+EthernetUDP ethernet_UDP;
+byte ntpMessageBuffer[48];
+int daylightSaving = S_1_HOUR;
 
 Servo servoMotor;
 int servoPosition;
@@ -178,6 +156,7 @@ int servoPosition;
 byte currentSwitchState = 0;
 bool debug = false;
 
+//
 boolean inProgress = false;
 
 float voltage0 = 0;
@@ -185,11 +164,20 @@ float voltage1 = 0;
 float voltage2 = 0;
 float voltage3 = 0;
 
+/*
+   Properties set via interface.
+*/
+long boostSecondsAB[] = {0, 0};
+bool scheduleOffForAB[] = {false, false};
+/*
+   Properties set as a result of processing the above and the schedule.
+   This occures using updateSwitchTimer.
+   These are used to drive the servos and the reply to the client
+*/
+long timeUntilNextChange[] = {0, 0};
+long timeRemainNextChange[] = {0, 0};
+bool statusForAB[] = {false, false};
 
-long offsetToEEPROM[] = {EEPROM_SECONDS_A, EEPROM_SECONDS_B};
-long secondsToOffAB[] = {0, 0};
-long remainingForA = 0;
-long remainingForB = 0;
 long loop_time = 0;
 long timer_wdt = 0;
 long last_seconds_set_time = 0;
@@ -215,40 +203,31 @@ void setup() {
   while (!Serial) {
     ; // wait for serial port to connect. Needed for Leonardo only
   }
-
-  loadEEPROM();
+  Serial.println("BOOT");
 
   /*
     Read the switch state from the EPROM
   */
   digitalPins();
 
-  if (!digitalRead(BTN_A_PIN) || !digitalRead(BTN_B_PIN)) {
-    last_seconds = 0;
-    debug = digitalRead(BTN_B_PIN);
-    EEPROM.write(EEPROM_DEBUG, debug);
-    M_SET_OFF(SWITCH_A);
-    M_SET_OFF(SWITCH_B);
-  }
-
-  while (!digitalRead(BTN_A_PIN) || !digitalRead(BTN_B_PIN)) {
-    delay(100);
-    digitalWrite(LEDACTPIN, HIGH);
-    delay(100);
-    digitalWrite(LEDACTPIN, LOW);
-  }
-
   servoInit();
 
   // start the Ethernet connection and the server:
-  Ethernet.begin(mac, ip);
+  Ethernet.begin(mac, ip, subnet, gateway);
   server.begin();
+
   if (debug) {
     Serial.print("server is at ");
     Serial.println(Ethernet.localIP());
   }
-  digitalWrite(LEDACTPIN, LOW);
+
   last_seconds_set_time = millis();
+  digitalWrite(LEDACTPIN, HIGH);
+  ethernet_UDP.begin(2390);
+
+  last_seconds = getTime();
+  digitalWrite(LEDACTPIN, LOW);
+
 }
 
 
@@ -270,73 +249,67 @@ void loop() {
     last_seconds_temp = last_seconds_diff / 1000;
     last_seconds = last_seconds + last_seconds_temp;
     last_seconds_diff = last_seconds_diff - (last_seconds_temp * 1000);
-    if (last_seconds_temp > 0) {
-      M_EEPROM_LONG(EEPROM_SECONDS, last_seconds);
-    }
   }
   /*
      Reset if we dont get here in time!
   */
   if (loop_time > timer_wdt) {
+    /*
+       Phew we got here in time so reset the watchdog timer
+    */
     timer_wdt = loop_time + WDT_DELAY;
-    if (!inProgress) {
-      wdt_reset();
-      if (debug) {
-        Serial.print(millis());
-        Serial.println(": WDT Reset:");
-      }
-    } else {
-      if (debug) {
-        Serial.print(millis());
-        Serial.println(": InProgress:");
-      }
-    }
+    wdt_reset();
   }
   /*
      Only look at the buttons every BTN_TIMER_DELAY ms
   */
   if (loop_time > button_timer) {
+
     button_timer = loop_time + BTN_TIMER_DELAY;
     if (!digitalRead(BTN_A_PIN)) {
       if (!button_a_pressed) {
-        seq_base_sw_a = SEQ_ON;
         button_a_pressed = true;
+        seq_base_sw_a = SEQ_OFF;
         buttonClearTimerA = loop_time + CLEAR_BUTTON_DELAY;
         buttonStateAB[SWITCH_A]++;
-        setTimeToOff(SWITCH_A);
       }
     } else {
       button_a_pressed = false;
       if ((buttonClearTimerA > 0) && (loop_time > buttonClearTimerA)) {
+        setBoostTime(SWITCH_A);
+        updateSwitchState(SWITCH_A);
         buttonStateAB[SWITCH_A] = 0;
         buttonClearTimerA = 0;
       }
     }
+
     if (!digitalRead(BTN_B_PIN)) {
       if (!button_b_pressed) {
-        seq_base_sw_b = SEQ_ON;
         button_b_pressed = true;
+        seq_base_sw_b = SEQ_OFF;
         buttonClearTimerB = loop_time + CLEAR_BUTTON_DELAY;
         buttonStateAB[SWITCH_B]++;
-        setTimeToOff(SWITCH_B);
       }
     } else {
       button_b_pressed = false;
       if ((buttonClearTimerB > 0) && (loop_time > buttonClearTimerB)) {
+        setBoostTime(SWITCH_B);
+        updateSwitchState(SWITCH_B);
         buttonStateAB[SWITCH_B] = 0;
         buttonClearTimerB = 0;
       }
     }
   }
   /*
-     Do we need to tourn on the heating/hot water
+     Do we need to change the state of the heating/hot water
   */
   if (loop_time > updateSwitchTimer) {
     updateSwitchTimer = loop_time + UPDATE_SWITCH_DELAY;
-    remainingForA = M_REMAINING_SEC(SWITCH_A);
-    remainingForB = M_REMAINING_SEC(SWITCH_B);
     setSwitchState();
+    Serial.print("Offset:");
+    Serial.println(last_seconds);
   }
+
   /*
      If servo power is ON and it is time to turn it OFF
   */
@@ -440,10 +413,8 @@ void loop() {
 
     if (path.indexOf("/debugon") >= 0) {
       debug = true;
-      EEPROM.write(EEPROM_DEBUG, debug);
     } else if (path.indexOf("/debugoff") >= 0) {
       debug = false;
-      EEPROM.write(EEPROM_DEBUG, debug);
     }
 
     if (debug) {
@@ -470,121 +441,63 @@ void loop() {
   if (loop_time > seq_led_timer) {
     seq_led_timer = loop_time + SEQ_TIME;
 
-    if (M_IS_ON(SWITCH_A)) {
-      seq_index_sw_a++;
-      if (seq_index_sw_a >= SEQ_LEN) {
-        seq_index_sw_a = seq_base_sw_a;
-      }
-      digitalWrite(LED_A_PIN, seqOut[seq_index_sw_a]);
-      if (remainingForA < S_1_HOUR) {
+    if (statusForAB[SWITCH_A]) {
+      if (timeRemainNextChange[SWITCH_A] <= S_1_BOOST) {
         seq_base_sw_a = SEQ_1H;
-      } else if (remainingForA < S_2_HOUR) {
+      } else if (timeRemainNextChange[SWITCH_A] <= S_2_BOOST) {
         seq_base_sw_a = SEQ_2H;
-      } else if (remainingForA < S_3_HOUR) {
+      } else if (timeRemainNextChange[SWITCH_A] <= S_3_BOOST) {
         seq_base_sw_a = SEQ_3H;
       } else {
-        seq_base_sw_a = SEQ_ON;
+        seq_base_sw_a = SEQ_OFF;
       }
+      digitalWrite(LED_A_PIN, seqOut[seq_index_sw_a]);
     } else {
       digitalWrite(LED_A_PIN, LOW);
-      seq_base_sw_a = SEQ_ON;
+      seq_base_sw_a = SEQ_OFF;
     }
 
-    if (M_IS_ON(SWITCH_B)) {
-      seq_index_sw_b++;
-      if (seq_index_sw_b >= SEQ_LEN) {
-        seq_index_sw_b = seq_base_sw_b;
-      }
+    if (statusForAB[SWITCH_B]) {
       digitalWrite(LED_B_PIN, seqOut[seq_index_sw_b]);
-      if (remainingForB < S_1_HOUR) {
+      if (timeRemainNextChange[SWITCH_B] <= S_1_BOOST) {
         seq_base_sw_b = SEQ_1H;
-      } else if (remainingForB < S_2_HOUR) {
+      } else if (timeRemainNextChange[SWITCH_B] <= S_2_BOOST) {
         seq_base_sw_b = SEQ_2H;
-      } else if (remainingForB < S_3_HOUR) {
+      } else if (timeRemainNextChange[SWITCH_B] <= S_3_BOOST) {
         seq_base_sw_b = SEQ_3H;
       } else {
-        seq_base_sw_b = SEQ_ON;
+        seq_base_sw_b = SEQ_OFF;
       }
     } else {
       digitalWrite(LED_B_PIN, LOW);
-      seq_base_sw_b = SEQ_ON;
+      seq_base_sw_b = SEQ_OFF;
     }
+
+    seq_index_sw_a++;
+    seq_index_sw_b++;
+    seq_step_all++;
+    if (seq_step_all >= SEQ_STEPS) {
+      seq_index_sw_a = seq_base_sw_a;
+      seq_index_sw_b = seq_base_sw_b;
+      seq_step_all = 0;
+    }
+
   }
 }
 
-
-void sendResponse(EthernetClient client, String method, String path, String body) {
-  if (method == "GET") {
-    path.toLowerCase();
-    if (path.indexOf("/switch") >= 0) {
-      handleSwitch(path);
-      sendSwitchStatus(client);
-    } else {
-      if (path.indexOf("/index.htm") >= 0) {
-        sendHtmlPage(client);
-      } else {
-        sendError(client, "Path not recognised", "404 Not Found");
-      }
-    }
-  } else {
-    sendError(client, "Only GET is Supported", "405 Method Not Allowed");
-  }
-  client.println("");
-  client.flush();
+void nextScheduledTime(int switchId) {
+  timeUntilNextChange[switchId] = 0;
+  timeRemainNextChange[switchId] = 0;
+  statusForAB[switchId] = false;
 }
 
-void handleSwitch(String path) {
-  /*
-    Set ALL the switches OFF
-  */
-  if (path.indexOf("all=off") > 0) {
-    M_SET_OFF(SWITCH_A);
-    M_SET_OFF(SWITCH_B);
-  }
-  /*
-     Set ALL the switches ON
-  */
-  if (path.indexOf("all=on") > 0) {
-    M_SET_ON(SWITCH_A, S_24_HOUR);
-    M_SET_ON(SWITCH_B, S_24_HOUR);
-  }
-  /*
-     Now deal with individual switchs.
-
-     We could receive: /switch?all=on&sa=off
-     which results in all switchs on except switch 1.
-  */
-  if (path.indexOf("sa=on") > 0) {
-    M_SET_ON(SWITCH_A, S_24_HOUR);
-  } else {
-    if (path.indexOf("sa=off") > 0) {
-      M_SET_OFF(SWITCH_A);
-    } else {
-      if (path.indexOf("sa=inv") > 0) {
-        M_SET_INV(SWITCH_A);
-      }
-    }
-  }
-
-  if (path.indexOf("sb=on") > 0) {
-    M_SET_ON(SWITCH_B, S_24_HOUR);
-  } else {
-    if (path.indexOf("sb=off") > 0) {
-      M_SET_OFF(SWITCH_B);
-    } else {
-      if (path.indexOf("sb=inv") > 0) {
-        M_SET_INV(SWITCH_B);
-      }
-    }
-  }
-}
 
 void setSwitchState() {
   int bits = 0;
-  if (M_IS_ON(SWITCH_A)) {
+  if (statusForAB[SWITCH_A]) {
     bits = bits | SWITCH_A_BIT;
   }
-  if M_IS_ON(SWITCH_B) {
+  if (statusForAB[SWITCH_B]) {
     bits = bits | SWITCH_B_BIT;
   }
   if (currentSwitchState == bits) {
@@ -608,97 +521,24 @@ void setSwitchState() {
   }
 }
 
-void sendSwitchStatus(EthernetClient client) {
-  voltage0  = analogRead(VOLTAGE_0_PIN) * IN_TO_VOLTS;
-  voltage1  = analogRead(VOLTAGE_1_PIN) * IN_TO_VOLTS;
-  voltage2  = analogRead(VOLTAGE_2_PIN) * IN_TO_VOLTS;
-  voltage3  = analogRead(VOLTAGE_3_PIN) * IN_TO_VOLTS;
-  String content = "{\"id\":\"" + DEV_ID_STR + "\",\"up\":\"" + String(millis()) + "\",\"debug\":" + (debug ? "true" : "false") + ","
-            "\"ra\":" + remainingForA + ","
-            "\"rb\":" + remainingForB + ","
-            "\"t0\":" + M_VIN_TO_CELC(voltage0) + ","
-            "\"t1\":" + M_VIN_TO_CELC(voltage1) + ","
-            "\"v0\":" + (voltage2 / 1000) + ","
-            "\"v1\":" + (voltage3 / 1000) +
-            "}";
-  client.println(HTTP_200);
-  client.print(HTTP_CONTENT_LEN);
-  client.println(content.length());
-  client.println(HTTP_CONTENT_TYPE_JSON);
-  client.println("");
-  client.println(content);
-  if (debug) {
-    Serial.print("[");
-    Serial.println(content);
-  }
-}
 
-void sendHtmlPage(EthernetClient client) {
-  int len = strlen_P(htmlPage);
-  client.println(HTTP_200);
-  client.print(HTTP_CONTENT_LEN);
-  client.println(len);
-  client.println(HTTP_CONTENT_TYPE_HTML);
-  client.println("");
-  char c1;
-  char c2;
-  for (int k = 0; k < len; k++) {
-    c1 = pgm_read_byte_near(htmlPage + k);
-    if (c1 == '$') {
-      k++;
-      c1 = pgm_read_byte_near(htmlPage + k);
-      switch (c1) {
-        case '0':
-          client.print(DEV_ID_STR);
-          break;
-        case '1':
-          client.print(DEV_A_NAME);
-          break;
-        case '2':
-          client.print(DEV_B_NAME);
-          break;
-        default:
-          client.write('$');
-          client.write(c1);
-      }
-    } else {
-      client.write(c1);
-    }
-  }
-  if (debug) {
-    Serial.println("HTML index.htm. Sent");
-  }
-}
-
-void sendError(EthernetClient client, String msg, String rc) {
-  String cont = "{\"id\":\"" + DEV_ID_STR + "\",\"err\":\"" + rc + "\",\"msg\":\"" + msg + "\"}";
-  client.println(HTTP_200);
-  client.print(HTTP_CONTENT_LEN);
-  client.println(cont.length());
-  client.println(HTTP_CONTENT_TYPE_JSON);
-  client.println("");
-  client.println(cont);
-  if (debug) {
-    Serial.println(cont);
-  }
-}
-
-void setTimeToOff(int switchId) {
+void setBoostTime(int switchId) {
   switch (buttonStateAB[switchId]) {
     case 1:
-      M_SET_ON(switchId, S_1_HOUR);
+      boostSecondsAB[switchId] = last_seconds + S_1_BOOST;
       break;
     case 2:
-      M_SET_ON(switchId, S_2_HOUR);
+      boostSecondsAB[switchId] = last_seconds + S_2_BOOST;
       break;
     case 3:
-      M_SET_ON(switchId, S_3_HOUR);
+      boostSecondsAB[switchId] = last_seconds + S_3_BOOST;
       break;
     default:
       buttonStateAB[switchId] = 0;
-      M_SET_OFF(switchId);
+      boostSecondsAB[switchId] = 0;
       break;
   }
+
 }
 
 void servoPos(int pos) {
@@ -747,26 +587,262 @@ void servoInit() {
   digitalWrite(EN_SV_PIN, LOW);
   digitalWrite(LEDACTPIN, LOW);
 }
-/*
-   Read the switch state from the EPROM when we start.
 
-   Note Un-Set EPROM locations retirn 255.
-*/
-void loadEEPROM() {
-  last_seconds = EEPROMReadlong(EEPROM_SECONDS);
-  secondsToOffAB[SWITCH_A] = EEPROMReadlong(EEPROM_SECONDS_A);
-  secondsToOffAB[SWITCH_B] = EEPROMReadlong(EEPROM_SECONDS_B);
-  debug = EEPROM.read(EEPROM_DEBUG);
+
+
+String param(String path, String key, int index) {
+  return "+++" + path.substring(index + key.length());
 }
 
-long EEPROMReadlong(long address) {
-  long four = EEPROM.read(address);
-  long three = EEPROM.read(address + 1);
-  long two = EEPROM.read(address + 2);
-  long one = EEPROM.read(address + 3);
-  long v = ((four << 0) & 0xFF) + ((three << 8) & 0xFFFF) + ((two << 16) & 0xFFFFFF) + ((one << 24) & 0xFFFFFFFF);
-  if ((v < 0) || (v > S_1_YEAR)) {
-    return 0;
+/*
+   -------------------------------------------------------------
+   JSON Responses section
+   -------------------------------------------------------------
+*/
+void sendResponse(EthernetClient client, String method, String path, String body) {
+  if (method == "GET") {
+    path.toLowerCase();
+    if (path.indexOf("/switch") >= 0) {
+      handleSwitch(path);
+      updateSwitchState(SWITCH_A);
+      updateSwitchState(SWITCH_B);
+      _sendSwitchStatus(client);
+    } else {
+      if (path.indexOf("/data") >= 0) {
+        _sendDataValues(client);
+      } else {
+        _sendError(client, "Path not recognised", "404 Not Found");
+      }
+    }
+  } else {
+    _sendError(client, "Only GET is Supported", "405 Method Not Allowed");
   }
-  return v;
+  client.println("");
+  client.flush();
+}
+
+
+void handleSwitch(String path) {
+
+  /*
+    long boostSecondsAB[] = {0, 0};
+    bool  = {false, false};
+
+  */
+  if (path.indexOf(DEV_T_A_ID + "=b1") > 0) {
+    boostSecondsAB[SWITCH_A] = last_seconds + S_1_BOOST;
+  }
+  if (path.indexOf(DEV_T_A_ID + "=b2") > 0) {
+    boostSecondsAB[SWITCH_A] = last_seconds + S_2_BOOST;
+  }
+  if (path.indexOf(DEV_T_A_ID + "=b3") > 0) {
+    boostSecondsAB[SWITCH_A] = last_seconds + S_3_BOOST;
+  }
+  if (path.indexOf(DEV_T_A_ID + "=on") > 0) {
+    boostSecondsAB[SWITCH_A] = last_seconds + S_24_BOOST;
+  }
+  if (path.indexOf(DEV_T_A_ID + "=off") > 0) {
+    boostSecondsAB[SWITCH_A] = 0;
+  }
+  if (path.indexOf(DEV_T_A_ID + "=soff") > 0) {
+    scheduleOffForAB[SWITCH_A] = true;
+  }
+  if (path.indexOf(DEV_T_A_ID + "=son") > 0) {
+    scheduleOffForAB[SWITCH_A] = false;
+  }
+
+  if (path.indexOf(DEV_T_B_ID + "=b1") > 0) {
+    boostSecondsAB[SWITCH_B] = last_seconds + S_1_BOOST;
+  }
+  if (path.indexOf(DEV_T_B_ID + "=b2") > 0) {
+    boostSecondsAB[SWITCH_B] = last_seconds + S_2_BOOST;
+  }
+  if (path.indexOf(DEV_T_B_ID + "=b3") > 0) {
+    boostSecondsAB[SWITCH_B] = last_seconds + S_3_BOOST;
+  }
+  if (path.indexOf(DEV_T_B_ID + "=on") > 0) {
+    boostSecondsAB[SWITCH_B] = last_seconds + S_24_BOOST;
+  }
+  if (path.indexOf(DEV_T_B_ID + "=off") > 0) {
+    boostSecondsAB[SWITCH_B] = 0;
+  }
+  if (path.indexOf(DEV_T_B_ID + "=soff") > 0) {
+    scheduleOffForAB[SWITCH_B] = true;
+  }
+  if (path.indexOf(DEV_T_B_ID + "=son") > 0) {
+    scheduleOffForAB[SWITCH_B] = false;
+  }
+
+
+}
+
+void updateSwitchState(int switchId) {
+  if (boostSecondsAB[switchId] < last_seconds) {
+    boostSecondsAB[switchId] = 0;
+  }
+
+  if (boostSecondsAB[switchId] > 0) {
+    timeUntilNextChange[switchId] = boostSecondsAB[switchId];
+    timeRemainNextChange[switchId] = timeUntilNextChange[switchId] - last_seconds;
+    statusForAB[switchId] = true;
+  } else {
+    if (scheduleOffForAB[switchId]) {
+      timeUntilNextChange[switchId] = 0; // There is no 'until'
+      timeRemainNextChange[switchId] = 0;
+      statusForAB[switchId] = false;
+    } else {
+      nextScheduledTime(switchId);
+    }
+  }
+
+}
+
+void _sendSwitchStatus(EthernetClient client) {
+  String content = "{\"id\":\"" + DEV_ID_STR + "\",\"sync\":" + String(last_seconds) + ","
+                   "\"" + DEV_T_A_ID + "\":" + timeUntilNextChange[SWITCH_A] + ","
+                   "\"" + DEV_S_A_ID + "\":" + statusForAB[SWITCH_A] + ","
+                   "\"" + DEV_T_B_ID + "\":" + timeUntilNextChange[SWITCH_B] + ","
+                   "\"" + DEV_S_B_ID + "\":" + statusForAB[SWITCH_B] +
+                   "}";
+  if (debug) {
+    Serial.print("[");
+    Serial.println(content);
+  }
+  client.println(HTTP_200);
+  client.print(HTTP_CONTENT_LEN);
+  client.println(content.length());
+  client.println(HTTP_CONTENT_TYPE_JSON);
+  client.println("");
+  client.println(content);
+}
+
+
+void _sendDataValues(EthernetClient client) {
+  voltage0  = analogRead(VOLTAGE_0_PIN) * IN_TO_VOLTS;
+  voltage1  = analogRead(VOLTAGE_1_PIN) * IN_TO_VOLTS;
+  voltage2  = analogRead(VOLTAGE_2_PIN) * IN_TO_VOLTS;
+  voltage3  = analogRead(VOLTAGE_3_PIN) * IN_TO_VOLTS;
+  String content = "{\"id\":\"" + DEV_ID_STR + "\",\"sync\":" + String(last_seconds) + ","
+                   "\"t0\":" + M_VIN_TO_CELC(voltage0) + ","
+                   "\"t1\":" + M_VIN_TO_CELC(voltage1) + ","
+                   "\"v0\":" + (voltage2 / 1000) + ","
+                   "\"v1\":" + (voltage3 / 1000) +
+                   "}";
+  if (debug) {
+    Serial.print("[");
+    Serial.println(content);
+  }
+  client.println(HTTP_200);
+  client.print(HTTP_CONTENT_LEN);
+  client.println(content.length());
+  client.println(HTTP_CONTENT_TYPE_JSON);
+  client.println("");
+  client.println(content);
+}
+
+
+
+void _sendError(EthernetClient client, String msg, String rc) {
+  String cont = "{\"id\":\"" + DEV_ID_STR + "\",\"err\":\"" + rc + "\",\"msg\":\"" + msg + "\"}";
+  client.println(HTTP_200);
+  client.print(HTTP_CONTENT_LEN);
+  client.println(cont.length());
+  client.println(HTTP_CONTENT_TYPE_JSON);
+  client.println("");
+  client.println(cont);
+  if (debug) {
+    Serial.println(cont);
+  }
+}
+/*
+   -------------------------------------------------------------
+   NTP (Network Time protocol) section.
+   This is where we look up the time and return the number of
+   seconds since last Monday 0:0:0
+
+   This happens once on reset. and sets last_seconds. From then
+   on last_seconds is incremented by the main loop.
+
+   You would only need to call NTP again if the seconds drift.
+   -------------------------------------------------------------
+*/
+unsigned long getTime()
+{
+
+  while (ethernet_UDP.parsePacket() > 0) ; // discard packets remaining to be parsed
+  Serial.println("NTP: Transmit Request");
+  // send packet to request time from NTP server
+  sendRequest(timeSrvr);
+
+  uint32_t beginWait = millis();
+  while (millis() - beginWait < 10000) {
+
+    if (ethernet_UDP.parsePacket() >= 48) {
+      Serial.println("NTP: Received Response");
+      // read data and save to messageBuffer
+      ethernet_UDP.read(ntpMessageBuffer, 48);
+
+      // NTP time received will be the seconds elapsed since 1 January 1900
+      unsigned long secsSince1900;
+
+      // convert to an unsigned long integer the reference timestamp found at byte 40 to 43
+      secsSince1900 =  (unsigned long)ntpMessageBuffer[40] << 24;
+      secsSince1900 |= (unsigned long)ntpMessageBuffer[41] << 16;
+      secsSince1900 |= (unsigned long)ntpMessageBuffer[42] << 8;
+      secsSince1900 |= (unsigned long)ntpMessageBuffer[43];
+      /*
+         Find number of whole days so we can find the Day of the week (wholeDays % 7)
+         Monday = 0
+         Thesday = 1
+         ...
+         And we can work in units of one day.
+      */
+      unsigned long wholeDays = secsSince1900 / S_24_HOUR;
+      /*
+         Find the number of seconds from this morning (today 0:0:0) until NOW.
+         Seconds since Jan 1 1990 (Which is a Monday 0:0:0) - Number of days * seconds per day
+      */
+      unsigned long secsRemainToday = secsSince1900 - (wholeDays * S_24_HOUR);
+      /*
+         Find number of seconds since Monday 0:0:0
+         DayOfWeek (wholeDays % 7) * seconds per day + seconds remaining from today
+         Also add 1 hour for Daylight Saving!
+      */
+      unsigned long secsSinceMonday =  ((wholeDays % 7) * S_24_HOUR) + secsRemainToday + daylightSaving;
+
+      Serial.print("NTP: Secs Since Monday:");
+      Serial.println(secsSinceMonday);
+
+      return secsSinceMonday;
+    }
+  }
+  // error if no response
+  Serial.println("Error: No Response.");
+  return 0;
+}
+/*
+   helper function for getTime()
+   this function sends a request packet 48 bytes long
+*/
+void sendRequest(IPAddress &address)
+{
+  // set all bytes in messageBuffer to 0
+  memset(ntpMessageBuffer, 0, 48);
+
+  // create the NTP request message
+
+  ntpMessageBuffer[0] = 0b11100011;  // LI, Version, Mode
+  ntpMessageBuffer[1] = 0;           // Stratum, or type of clock
+  ntpMessageBuffer[2] = 6;           // Polling Interval
+  ntpMessageBuffer[3] = 0xEC;        // Peer Clock Precision
+  // array index 4 to 11 is left unchanged - 8 bytes of zero for Root Delay & Root Dispersion
+  ntpMessageBuffer[12]  = 49;
+  ntpMessageBuffer[13]  = 0x4E;
+  ntpMessageBuffer[14]  = 49;
+  ntpMessageBuffer[15]  = 52;
+
+  // send messageBuffer to NTP server via UDP at port 123
+  ethernet_UDP.beginPacket(address, 123);
+  ethernet_UDP.write(ntpMessageBuffer, 48);
+  ethernet_UDP.endPacket();
 }
